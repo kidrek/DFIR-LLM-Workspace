@@ -104,14 +104,17 @@ Use `docker/dfir.sh` (see workspace `CLAUDE.md`). Image: `dfir-toolkit`.
       --timeline /data/reports/viz/timeline.csv \
       --zeek /data/analysis/network/zeek \
       --proc /data/analysis/<HOST>/evtx/Security.tsv \
+      --proc-linux /data/analysis/<LINUX_HOST>/proctree/proctree.json \
       --out /data/reports --title "<case>"
     ```
     Produces `reports/dashboard.html` (self-contained: timeline, actor graph,
     process trees, observables, IOCs, ATT&CK) with a client-side **endpoint
     filter** ("All endpoints" = global). `--proc` takes flattened Security 4688
     TSVs (repeatable); parentage is resolved by PID + time so a PID reused after
-    a reboot does not merge unrelated processes. `dashboard_data.json` holds the
-    embedded payload.
+    a reboot does not merge unrelated processes. `--proc-linux` takes a
+    `proctree.json` from `linux_proctree.py` (repeatable) to drop a Linux
+    snapshot tree into the same panel. `dashboard_data.json` holds the embedded
+    payload.
 
 ## ESXi / VMware analysis
 Artifacts (ForensicArtifacts `esxi.yaml`): `hostd.log`, `vmkernel.log`,

@@ -90,7 +90,10 @@ loosen these.
   `regipy`, `python-registry`, `sqlite3`, `libesedb-utils`.
 - **Linux / macOS:** `plaso` (`log2timeline.py`, `psort.py`) for super-timelines,
   `mac_apt` (macOS plists, unified logs, FSEvents), `sqlite3`, `util-linux`
-  (`last`, `lastlog`), `yara`, `foremost`.
+  (`last`, `lastlog`), `yara`, `foremost`. Helper `docker/linux_proctree.py`
+  builds a process tree from a UAC/LinuxCatScale `/proc` snapshot plus the
+  systemd journal and `auth.log`/`syslog` (exact snapshot PPid; inferred
+  journal parentage), rendering JSON/CSV/DOT/HTML/SVG/PNG.
 - **Disk images:** `sleuthkit` (fls/mmls/icat), `ewf-tools`, `libfsapfs-utils`,
   `libfvde-utils`, `libvmdk-utils`, `libvslvm-utils`, `libbde-utils`,
   `p7zip-full`.

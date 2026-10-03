@@ -176,7 +176,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ---- Visualization assets (incident_viz.py) ---------------------------------
 # Static-format deps and vendored JS. Kept in a late layer so adding them does
 # not invalidate the heavy plaso/Zeek/ClamAV/mac_apt layers above.
-RUN pip3 install --no-cache-dir --break-system-packages matplotlib networkx
+# graphviz `dot` renders the Linux process tree to svg/png.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends graphviz \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install --no-cache-dir --break-system-packages matplotlib networkx
 
 # Vendor the JS bundles so rendered HTML is single-file and fully offline.
 # The helper inlines these into each deliverable (no network, no CDN).
@@ -209,6 +213,12 @@ RUN printf '#!/bin/sh\n# usage: evtx2json <file.evtx> [out.jsonl]\nexec evtx_dum
 # docker/ at /data/tools/; this creates a PATH entry for convenience.
 RUN printf '#!/bin/sh\nexec python3 /data/tools/esxi_triage.py "$@"\n' \
         > /usr/local/bin/esxi_triage && chmod +x /usr/local/bin/esxi_triage
+
+# ---- Linux process-tree helper ----------------------------------------------
+# Build a process tree (exact /proc snapshot + inferred journal history) from a
+# UAC/LinuxCatScale-style triage bundle. `dot` comes from graphviz above.
+RUN printf '#!/bin/sh\nexec python3 /data/tools/linux_proctree.py "$@"\n' \
+        > /usr/local/bin/linux_proctree && chmod +x /usr/local/bin/linux_proctree
 
 # Output ownership: run as the caller's uid/gid (see docker/dfir.sh)
 WORKDIR /data

@@ -108,8 +108,10 @@ Mounts:
   `PECmd`, `LECmd`, `JLECmd`, `SBECmd`, `AmcacheParser`,
   `AppCompatCacheParser`, `SrumECmd`, `RECmd`, `EvtxECmd`, `regipy`,
   `sqlite3`, `libesedb-utils`.
-- **Linux / macOS:** `plaso` (`log2timeline.py`/`psort.py`), `mac_apt`,
-  `sqlite3`, `util-linux`.
+- **Linux / macOS:** `plaso` (`log2timeline.py`/`psort.py`), `mac_apt`
+  (macOS plists, unified logs, FSEvents), `sqlite3`, `util-linux`,
+  `linux_proctree.py` (process tree from a `/proc` snapshot + systemd
+  journal/`auth.log` → JSON/CSV/DOT/HTML/SVG/PNG).
 - **Disk images:** `sleuthkit`, `ewf-tools`, `libfsapfs-utils`,
   `libvmdk-utils`, `p7zip-full`.
 - **Network:** `tshark`, `zeek`.
@@ -228,6 +230,39 @@ docker/dfir.sh qemu-nbd --read-only -c /dev/nbd0 /data/evidences/disk.vmdk
 > the `Hostd[...]`/`vobd[...]` grammar — `esxi_triage.py` is the parser for
 > this data.
 
+## Linux process tree
+
+`linux_proctree.py` builds a process tree and process-event timeline for a
+Linux host from a UAC/LinuxCatScale-style triage bundle. It combines two
+complementary views:
+
+- **Snapshot** — the exact parent/child tree from the collection instant,
+  using `/proc/<pid>/status` `PPid` and `ps -axwwSo` (no inference needed).
+  Enriched with `/proc/<pid>/cmdline`, `exe` links and SHA-1 hashes.
+- **Journal** — best-effort historical process events from the systemd journal
+  (`journalctl --file`/`-D`, read offline) plus pid-tagged `auth.log`/`syslog`
+  lines (`sudo`, `su`, `sshd`, `CRON`, `systemd`).
+
+> This host's journal carries **no `_PPID`** and there is no `auditd`/memory
+> image, so journal parentage is *inferred* (cgroup/unit + a time-aware
+> PID-reuse rule). Snapshot edges are `exact`; journal edges are `inferred`.
+
+```sh
+docker/dfir.sh linux_proctree \
+  --snapshot /data/analysis/extracted/app01/catscale_out/Process_and_Network \
+  --logdir   /data/analysis/extracted/app01/catscale_out \
+  --host app01 --tz "+02:00" \
+  --since 2025-12-26T00:40:00Z --until 2025-12-26T05:30:00Z \
+  --out /data/analysis/app01/proctree --title "app01 process tree" \
+  --formats json,csv,dot,html,svg,png
+```
+
+Outputs to `--out`: `proctree.json` (nodes + edges with provenance),
+`proctree.csv` / `process_events.csv` (flat), `proctree.dot` (Graphviz) and,
+when requested, `proctree.svg`/`.png` (via `dot`) and `proctree.html` (single
+offline file, vis-network inlined from `/opt/viz-assets`). `--all` ignores the
+window; `--logdir` auto-discovers the journal tar and text logs.
+
 ## Incident visualization
 
 `incident_viz.py` renders analyst-facing diagrams from artifacts you have
@@ -291,11 +326,15 @@ Outputs `reports/dashboard.html` (self-contained) and
   "hide benign/responder" toggle.
 - **Per-endpoint attribution** — observables carry a `hosts: [...]` field;
   when absent it is inferred from the entry's `source`/`context` text.
-- **Process trees** — built from flattened Security 4688 (`--proc`, repeatable).
-  Parentage is resolved by **PID + time** (parent must not post-date the child),
-  so a PID reused after a reboot does not graft unrelated processes together.
-  Trees keep attacker-relevant processes, their ancestor chain and descendants;
-  identical leaf roots (e.g. 15 `wevtutil cl` calls) are collapsed with ×N.
+- **Process trees** — built from flattened Security 4688 (`--proc`, repeatable)
+  and/or a Linux snapshot (`--proc-linux`, a `proctree.json` from
+  `linux_proctree.py`, repeatable). Parentage is resolved by **PID + time**
+  (parent must not post-date the child), so a PID reused after a reboot does not
+  graft unrelated processes together. Trees keep attacker-relevant processes,
+  their ancestor chain and descendants; identical leaf roots (e.g. 15
+  `wevtutil cl` calls) are collapsed with ×N. The Linux path carries exact
+  snapshot `PPid`; journal-inferred edges stay in the standalone
+  `proctree.html`.
 - Panels: **Overview**, **Timeline**, **Actor graph**, **Process trees**,
   **Observables** (all, incl. benign), **IOCs** (benign removed), **ATT&CK**.
 

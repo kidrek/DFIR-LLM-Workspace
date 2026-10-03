@@ -43,6 +43,10 @@ try:
     import incident_viz as viz  # reuse colours / heuristics / graph build
 except Exception:  # noqa: BLE001 -- degrade to local copies if unavailable
     viz = None
+try:
+    import linux_proctree as lpt  # reuse Linux interest heuristic
+except Exception:  # noqa: BLE001
+    lpt = None
 
 # local fallbacks if incident_viz is missing ---------------------------------- #
 TACTIC_ORDER = getattr(viz, "TACTIC_ORDER", [
@@ -336,6 +340,123 @@ def build_trees(events: list[dict]) -> dict[str, list[dict]]:
 
 
 # --------------------------------------------------------------------------- #
+# process tree from a Linux `linux_proctree.py` snapshot (--proc-linux)
+# --------------------------------------------------------------------------- #
+LINUX_INTERESTING = re.compile(
+    r"\bcron\b|/dev/shm|/tmp/|\.upd\b|curl|wget|base64|bash -c|nc\b|ncat|"
+    r"socat|chisel|python3? -c|systemd-journald-helper|updat3|realm|"
+    r"sudo|/bin/su\b|\bsu\b|sshd|tmux|xterm|wsgi|uwsgi|mysql|sqlite|"
+    r"velociraptor|ssh-agent",
+    re.I)
+
+
+def _linux_interesting(s: str) -> bool:
+    if lpt is not None:
+        return lpt.is_interesting(s)
+    return bool(LINUX_INTERESTING.search(s or ""))
+
+
+def read_linux_tree(path: str) -> tuple[str, list[dict]]:
+    """Read a proctree.json from linux_proctree.py -> (host, pruned roots).
+
+    Mirrors the Windows strategy: keep interesting processes, their ancestor
+    chain and descendants; prune unrelated siblings; collapse identical leaves.
+    """
+    d = json.load(open(path, encoding="utf-8"))
+    host = norm_host(d.get("host", "linux"))
+    raw = d.get("snapshot_roots", []) or []
+
+    # --- normalise into the dashboard node shape, indexed by full path ---
+    idx: dict[int, dict] = {}
+    parent_of: dict[int, int | None] = {}
+    order: list[dict] = []
+
+    def walk(node, parent):
+        key = len(order)
+        n = {
+            "pid": node.get("pid"), "name": node.get("name", ""),
+            "cmd": (node.get("cmd") or "")[:220], "user": node.get("user", ""),
+            "ts": node.get("ts", ""),
+            "interesting": bool(node.get("interesting")) or
+                           _linux_interesting(f'{node.get("name","")} {node.get("cmd","")}'),
+            "children": [], "_id": key,
+        }
+        idx[key] = n
+        parent_of[key] = parent["_id"] if parent else None
+        order.append(n)
+        if parent is not None:
+            parent["children"].append(n)
+        for c in node.get("children", []):
+            walk(c, n)
+
+    roots_raw: list[dict] = []
+    for r in raw:
+        n = {"pid": r.get("pid"), "name": r.get("name", ""),
+             "cmd": (r.get("cmd") or "")[:220], "user": r.get("user", ""),
+             "ts": r.get("ts", ""), "interesting": False, "children": [], "_id": None}
+        n["interesting"] = bool(r.get("interesting")) or \
+            _linux_interesting(f'{r.get("name","")} {r.get("cmd","")}')
+        n["_id"] = len(order)
+        idx[n["_id"]] = n
+        parent_of[n["_id"]] = None
+        order.append(n)
+        for c in r.get("children", []):
+            walk(c, n)
+        roots_raw.append(n)
+
+    if not order:
+        return host, []
+
+    # --- keep interesting nodes + ancestors + descendants (Windows strategy) ---
+    keep: set[int] = set()
+
+    def mark_ancestors(i):
+        seen = set()
+        while i is not None and i in idx and i not in seen:
+            seen.add(i)
+            keep.add(i)
+            i = parent_of.get(i)
+
+    def mark_descendants(i, depth=0):
+        if depth > 6:
+            return
+        for c in idx[i]["children"]:
+            if c["_id"] not in keep:
+                keep.add(c["_id"])
+                mark_descendants(c["_id"], depth + 1)
+
+    for n in order:
+        if n["interesting"]:
+            keep.add(n["_id"])
+            mark_ancestors(parent_of.get(n["_id"]))
+            mark_descendants(n["_id"])
+
+    def build_pruned(n):
+        kids = [build_pruned(c) for c in n["children"] if c["_id"] in keep]
+        kids = [k for k in kids if k]
+        return {"pid": n["pid"], "name": n["name"], "cmd": n["cmd"],
+                "user": n["user"], "ts": n["ts"], "interesting": n["interesting"],
+                "children": kids}
+
+    pruned = [build_pruned(r) for r in roots_raw if r["_id"] in keep]
+    pruned = [p for p in pruned if p]
+
+    # collapse identical leaf roots (e.g. repeated cron/sudo invocations)
+    merged: list[dict] = []
+    leaf_index: dict[tuple, dict] = {}
+    for r in pruned:
+        key = (r["name"], r["user"]) if not r["children"] else None
+        if key and key in leaf_index:
+            leaf_index[key]["repeat"] += 1
+            continue
+        r.setdefault("repeat", 1)
+        if key:
+            leaf_index[key] = r
+        merged.append(r)
+    return host, merged
+
+
+# --------------------------------------------------------------------------- #
 # graph with host attribution
 # --------------------------------------------------------------------------- #
 def build_graph(iocs: dict, zeek_edges: list[dict], ipmap: dict[str, str]):
@@ -495,8 +616,7 @@ a{color:var(--acc)}
     <div id="graphContainer" style="width:100%;height:64vh"></div>
   </section>
   <section class="panel" id="p-trees">
-    <p class="hint">Process trees derived from Security 4688 (attacker-relevant
-      processes + lineage). Endpoint-filtered.</p>
+    <p class="hint">$treehint</p>
     <div id="trees"></div>
   </section>
   <section class="panel" id="p-observables">
@@ -650,17 +770,24 @@ function obsRow(o){
   const hs = (o.hosts||[]).map(h=>`<span class="tag">${esc(h)}</span>`).join('');
   const tags=(o.tags||[]).map(t=>`<span class="tag">${esc(t)}</span>`).join('');
   const conf=o.confidence?`<span class="badge b-${o.confidence}">${o.confidence}</span>`:'';
-  return `<tr><td>${esc(o.type)}</td><td>${val}</td><td>${esc(o.role||'')}</td>
-    <td>${hs}</td><td>${conf}</td><td class="mono">${esc(o.first_seen_utc||'')}</td>
+  return `<tr><td class="mono">${esc(o.first_seen_utc||'')}</td>
+    <td>${esc(o.type)}</td><td>${val}</td><td>${esc(o.role||'')}</td>
+    <td>${hs}</td><td>${conf}</td>
     <td>${esc(o.mitre||'')}</td><td>${tags}</td>
     <td>${esc(o.context||'')}</td><td>${esc(o.source||'')}</td></tr>`;
 }
-const OBS_HEAD=['type','value (defanged)','role','endpoints','confidence','first seen (UTC)','mitre','tags','context','source'];
+const OBS_HEAD=['first seen (UTC)','type','value (defanged)','role','endpoints','confidence','mitre','tags','context','source'];
 function renderTable(elId, list){
   const el=document.getElementById(elId);
   if(!list.length){ el.innerHTML='<div class="empty">No rows for this filter.</div>'; return; }
+  // oldest -> newest (lowest timestamp first); rows with no timestamp sort last
+  const rows=[...list].sort((a,b)=>{
+    const x=a.first_seen_utc||'', y=b.first_seen_utc||'';
+    if(!x) return 1; if(!y) return -1;
+    return x.localeCompare(y);
+  });
   el.innerHTML=`<table><thead><tr>${OBS_HEAD.map(h=>`<th>${h}</th>`).join('')}</tr></thead>
-    <tbody>${list.map(obsRow).join('')}</tbody></table>`;
+    <tbody>${rows.map(obsRow).join('')}</tbody></table>`;
 }
 function renderObservables(){ renderTable('obsTable', filtObs(DATA.observables)); }
 function renderIocs(){ renderTable('iocTable', filtObs(DATA.observables).filter(o=>!isBenign(o))); }
@@ -735,13 +862,15 @@ renderAll();
 """
 
 
-def render_html(title: str, subtitle: str, data: dict) -> str:
+def render_html(title: str, subtitle: str, data: dict, treehint: str = "") -> str:
     visnet = _load_asset("vis-network.min.js")
     vistimeline = _load_asset("vis-timeline-graph2d.min.js")
     css = _load_asset("vis-timeline-graph2d.min.css")
     subs = {
         "$title": html.escape(title),
         "$subtitle": html.escape(subtitle),
+        "$treehint": html.escape(treehint or
+            "Attacker-relevant processes + lineage. Endpoint-filtered."),
         "$generated": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "$viscss": css,
         "$visnet": visnet,
@@ -769,6 +898,8 @@ def main(argv=None) -> int:
     ap.add_argument("--proc", action="append", default=[],
                     help="flattened Security.tsv (4688); repeatable")
     ap.add_argument("--proc-host", default="", help="override host name for --proc files")
+    ap.add_argument("--proc-linux", action="append", default=[],
+                    help="proctree.json from linux_proctree.py; repeatable")
     ap.add_argument("--out", required=True, help="output directory")
     ap.add_argument("--title", default="Incident", help="case title")
     args = ap.parse_args(argv)
@@ -806,17 +937,43 @@ def main(argv=None) -> int:
     for p in args.proc:
         events += read_process_events(p, args.proc_host)
     trees = build_trees(events)
+    for p in args.proc_linux:
+        if os.path.isfile(p):
+            lhost, lroots = read_linux_tree(p)
+            if lroots:
+                trees[lhost] = lroots
+            else:
+                trees.setdefault(lhost, [])
 
-    # host universe
-    hosts = set()
-    for o in obs:
-        hosts.update(o.get("hosts") or [])
+    # host universe ---------------------------------------------------------
+    # Rule: an endpoint is only shown when it has data in at least one of the
+    # four Overview metrics -- timeline events, observables, non-benign IOCs,
+    # or ATT&CK techniques. Host names surfaced from EVTX `computer` fields /
+    # empty trees (all-zero cards) are dropped. Because renderChips,
+    # renderOverview and the Endpoints stat all iterate DATA.hosts, this alone
+    # removes the zeros everywhere.
+    def _is_benign(o):
+        t = " ".join(o.get("tags") or []).lower() + " " + (o.get("confidence") or "")
+        return bool(re.search(r"benign|responder|internal", t))
+
+    tl_hosts, obs_hosts, ioc_hosts, atk_hosts = set(), set(), set(), set()
     for r in timeline:
         if r["host"]:
-            hosts.add(r["host"])
-    for n in nodes:
-        hosts.update(n.get("hosts") or [])
+            tl_hosts.add(r["host"])
+    for o in obs:
+        hs = o.get("hosts") or []
+        obs_hosts.update(hs)
+        if not _is_benign(o):
+            ioc_hosts.update(hs)
+        if re.search(r"\bT\d{4}", o.get("mitre") or ""):
+            atk_hosts.update(hs)
+
+    keep = tl_hosts | obs_hosts | ioc_hosts | atk_hosts
+    hosts = set(keep)
     hosts.discard("")
+    # drop tree entries for endpoints that are no longer shown
+    trees = {h: r for h, r in trees.items() if h in hosts}
+
     order = ["Attacker", "SqlSvr", "DC2", "DC1", "Network"]
     hosts_sorted = sorted(hosts, key=lambda h: (order.index(h) if h in order else 99, h))
 
@@ -840,9 +997,24 @@ def main(argv=None) -> int:
 
     subtitle = ("Single-file incident dashboard — filter by endpoint; "
                 "'All endpoints' is the global view.")
+
+    # process-tree panel hint: name only the sources actually supplied
+    parts, notes = [], []
+    if any(os.path.isfile(p) for p in args.proc):
+        parts.append("Windows Security 4688")
+    if any(os.path.isfile(p) for p in args.proc_linux):
+        parts.append("the Linux /proc snapshot")
+        notes.append("journal/auth events are in the standalone tree")
+    if parts:
+        treehint = ("Process trees from " + " and ".join(parts) +
+                    " — attacker-relevant processes + lineage, endpoint-filtered.")
+        if notes:
+            treehint += " (" + "; ".join(notes) + ")"
+    else:
+        treehint = "No process-tree sources provided."
     out_html = os.path.join(args.out, "dashboard.html")
     with open(out_html, "w", encoding="utf-8") as fh:
-        fh.write(render_html(args.title, subtitle, data))
+        fh.write(render_html(args.title, subtitle, data, treehint))
 
     # also drop the machine-readable payload for reuse
     with open(os.path.join(args.out, "dashboard_data.json"), "w", encoding="utf-8") as fh:

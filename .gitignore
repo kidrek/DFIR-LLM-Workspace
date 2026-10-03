@@ -1,0 +1,22 @@
+# Evidence is never committed: it is large, sensitive, and immutable.
+evidences/*
+!evidences/.gitkeep
+
+# Derived output and deliverables are per-case, not part of the template.
+analysis/*
+!analysis/.gitkeep
+reports/*
+!reports/.gitkeep
+notes/*
+!notes/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*~

@@ -1,0 +1,151 @@
+# DFIR toolkit image (tri-OS)
+# Container-only forensic analysis: Windows (EVTX, MFT, registry, execution
+# artifacts), Linux (journals, auditd, disk images), macOS (plists, unified
+# logs, SQLite), and network (PCAP/PCAPNG).
+#
+# Build:  docker build -t dfir-toolkit docker/
+#
+# Pinned-component versions are declared below for reproducibility.
+
+FROM ubuntu:24.04
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# ---- component versions -----------------------------------------------------
+ENV EVTX_DUMP_VER=v0.12.3 \
+    CHAINSAW_VER=v2.16.5 \
+    HAYABUSA_VER=4.1.0 \
+    SIGMA_REF=r2026-07-01 \
+    DOTNET_CHANNEL=9.0
+
+# ---- base OS packages -------------------------------------------------------
+# Includes cross-platform parsers, SQLite/EDB readers, archive/disk-image
+# tools, and the build deps required to install plaso from source.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg xz-utils unzip zip tar git \
+        python3 python3-pip python3-dev \
+        build-essential pkg-config \
+        libssl-dev liblzma-dev zlib1g-dev libffi-dev \
+        tshark tcpdump tcpflow \
+        sleuthkit \
+        sqlite3 \
+        p7zip-full \
+        libesedb-utils \
+        yara \
+        foremost \
+        ewf-tools \
+        libfsapfs-utils \
+        libfvde-utils \
+        libvmdk-utils \
+        libvslvm-utils \
+        libbde-utils \
+        util-linux \
+        jq ripgrep file less vim-tiny \
+        binutils \
+        libicu74 \
+        brotli \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-interactive tshark (no privilege issue in container)
+RUN echo 'wireshark-common wireshark-common/install-setuid boolean false' \
+        | debconf-set-selections || true
+
+# ---- .NET runtime (for Eric Zimmerman tools) --------------------------------
+RUN curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh \
+    && bash /tmp/dotnet-install.sh --channel "${DOTNET_CHANNEL}" --runtime dotnet --install-dir /usr/share/dotnet \
+    && ln -s /usr/share/dotnet/dotnet /usr/local/bin/dotnet \
+    && rm /tmp/dotnet-install.sh
+
+# ---- evtx_dump (Rust, static musl) ------------------------------------------
+# NOTE: named evtx_dump_rs to avoid colliding with python-evtx's evtx_dump.
+RUN curl -fsSL -o /usr/local/bin/evtx_dump_rs \
+        "https://github.com/omerbenamram/evtx/releases/download/${EVTX_DUMP_VER}/evtx_dump-${EVTX_DUMP_VER}-x86_64-unknown-linux-musl" \
+    && chmod +x /usr/local/bin/evtx_dump_rs
+
+# ---- Chainsaw (Sigma hunting / EVTX triage) ---------------------------------
+RUN curl -fsSL -o /tmp/chainsaw.tar.gz \
+        "https://github.com/WithSecureOpenSource/chainsaw/releases/download/${CHAINSAW_VER}/chainsaw_x86_64-unknown-linux-gnu.tar.gz" \
+    && mkdir -p /opt/chainsaw \
+    && tar -xzf /tmp/chainsaw.tar.gz -C /opt/chainsaw --strip-components=1 \
+    && ln -s /opt/chainsaw/chainsaw /usr/local/bin/chainsaw \
+    && rm /tmp/chainsaw.tar.gz
+
+# ---- Hayabusa (Windows EVTX fast-forensics timeline) ------------------------
+RUN curl -fsSL -o /tmp/hayabusa.zip \
+        "https://github.com/Yamato-Security/hayabusa/releases/download/v${HAYABUSA_VER}/hayabusa-${HAYABUSA_VER}-lin-x64-gnu.zip" \
+    && mkdir -p /opt/hayabusa \
+    && unzip -q /tmp/hayabusa.zip -d /opt/hayabusa \
+    && chmod +x "/opt/hayabusa/hayabusa-${HAYABUSA_VER}-lin-x64-gnu" \
+    && ln -s "/opt/hayabusa/hayabusa-${HAYABUSA_VER}-lin-x64-gnu" /usr/local/bin/hayabusa \
+    && rm /tmp/hayabusa.zip
+
+# ---- Sigma rules (for Chainsaw) ---------------------------------------------
+RUN git clone --depth 1 --branch "${SIGMA_REF}" https://github.com/SigmaHQ/sigma.git /opt/sigma \
+    && rm -rf /opt/sigma/.git
+
+# ---- Eric Zimmerman tools (.NET 9) ------------------------------------------
+# Each tool ships as net9/<Tool>.zip containing <Tool>.dll. Fetch, unpack, and
+# wrap in a small launcher on PATH.
+RUN set -eux; \
+    for tool in MFTECmd PECmd LECmd JLECmd SBECmd AmcacheParser \
+                AppCompatCacheParser SrumECmd RECmd EvtxECmd; do \
+        curl -fsSL -o "/tmp/${tool}.zip" "https://download.ericzimmermanstools.com/net9/${tool}.zip"; \
+        mkdir -p "/opt/zimmerman/${tool}"; \
+        unzip -q "/tmp/${tool}.zip" -d "/opt/zimmerman/${tool}"; \
+        printf '#!/bin/sh\nexec dotnet /opt/zimmerman/%s/%s.dll "$@"\n' "${tool}" "${tool}" \
+            > "/usr/local/bin/${tool}"; \
+        chmod +x "/usr/local/bin/${tool}"; \
+        rm -f "/tmp/${tool}.zip"; \
+    done
+
+# ---- Python DFIR libraries --------------------------------------------------
+# python-evtx        - EVTX parsing fallback
+# regipy/python-registry - Windows registry hives
+# plaso              - cross-platform super-timeline (log2timeline.py/psort.py)
+# volatility3        - memory forensics
+# yara-python        - pattern matching
+# dfir-unfurl        - browser/URL history
+RUN pip3 install --no-cache-dir --break-system-packages \
+        python-evtx \
+        pandas \
+        python-dateutil \
+        regipy \
+        python-registry \
+        volatility3 \
+        yara-python \
+        dfir-unfurl
+
+# ---- plaso (super-timeline engine; large install, kept as its own layer) ----
+RUN pip3 install --no-cache-dir --break-system-packages plaso
+
+# ---- Zeek (network logs: mssql, smb, dce_rpc, kerberos, http) ---------------
+RUN . /etc/os-release \
+    && echo "deb [trusted=yes] http://download.opensuse.org/repositories/security:/zeek/xUbuntu_${VERSION_ID}/ /" \
+        > /etc/apt/sources.list.d/zeek.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends zeek-lts \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /opt/zeek/bin/zeek /usr/local/bin/zeek \
+    && ln -sf /opt/zeek/bin/zeek-cut /usr/local/bin/zeek-cut || true
+
+# ---- mac_apt (macOS plists, unified logs, FSEvents, SQLite artifacts) -------
+# Optional: APOLLO is deliberately omitted (Swift toolchain is heavy); add it
+# as a separate layer if unified-archive parsing is required.
+RUN git clone --depth 1 https://github.com/ydkhatri/mac_apt.git /opt/mac_apt \
+    && rm -rf /opt/mac_apt/.git \
+    && pip3 install --no-cache-dir --break-system-packages /opt/mac_apt \
+    && ln -sf /opt/mac_apt/mac_apt.py /usr/local/bin/mac_apt || true
+
+# ---- ForensicArtifacts catalog (coverage manifest, not a parser) ------------
+# YAML definitions of artifact locations for Windows/Linux/macOS. Used as a
+# checklist to compare present evidence against known artifact classes.
+RUN git clone --depth 1 https://github.com/ForensicArtifacts/artifacts.git /opt/forensic-artifacts \
+    && rm -rf /opt/forensic-artifacts/.git
+
+# ---- analysis helper: dump one EVTX to JSONL with evtx_dump ------------------
+RUN printf '#!/bin/sh\n# usage: evtx2json <file.evtx> [out.jsonl]\nexec evtx_dump_rs -o jsonl "$@"\n' \
+        > /usr/local/bin/evtx2json && chmod +x /usr/local/bin/evtx2json
+
+# Output ownership: run as the caller's uid/gid (see docker/dfir.sh)
+WORKDIR /data
+CMD ["/bin/bash"]

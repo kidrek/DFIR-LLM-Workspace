@@ -28,8 +28,16 @@ evidence, or a timeline + IOCs + report must be produced.
 5. **Scope** — accounts, hosts, privileges, persistence, lateral movement.
 6. **Impact** — data accessed/exfiltrated, credentials compromised.
 7. **Timeline** — consolidated UTC attack chain.
-8. **Report** — executive summary, per-task answers with evidence, IOCs,
-   ATT&CK mapping, gaps/unknowns.
+8. **Visualize** — render the attack timeline, actor/network graph and ATT&CK
+   matrix from the artifacts (`analysis/iocs.json`, the timeline table,
+   Zeek logs) with `docker/incident_viz.py`; reference the HTML/SVG from the
+   report (see dfir skill, workflow step 14).
+9. **Endpoint dashboard** — build the single-file, filterable dashboard
+   (`reports/dashboard.html`) with `docker/incident_dashboard.py`; it aggregates
+   timeline, actor graph, process trees, observables, IOCs and the ATT&CK matrix
+   and scopes them by endpoint (see dfir skill, workflow step 15).
+10. **Report** — executive summary, per-task answers with evidence, IOCs,
+    ATT&CK mapping, gaps/unknowns.
 
 ## Task-tracking template
 For each question keep a row: `id | question | answer | evidence(file:record) |
@@ -51,10 +59,16 @@ T1087 Account Discovery, T1482 Domain Trust Discovery).
 2. Environment & evidence inventory (hashes).
 3. Attack-chain timeline (UTC, per host).
 4. Task answers (each with evidence citation).
-5. IOCs (defanged): URLs, hashes, accounts, IPs, services, filenames.
-6. ATT&CK coverage table.
-7. Gaps, assumptions and unknowns.
-8. Recommendations / containment.
+5. IOCs (defanged): URLs, hashes, accounts, IPs, services, filenames —
+   maintain `analysis/iocs.json` and export `analysis/iocs.csv` (+
+   `analysis/iocs_threatintel.csv`) via `docker/ioc_export.py` (see dfir skill).
+   Tag internal/benign/responder observables `benign` so they are excluded from
+   the threat-intel view.
+6. ATT&CK coverage table (see also the generated `mitre_matrix.html`).
+7. Visual deliverables — attack timeline and actor/network graph
+   (`reports/viz/*.html`, `*.svg`) from `docker/incident_viz.py`.
+8. Gaps, assumptions and unknowns.
+9. Recommendations / containment.
 
 ## Hand-off
 Parsing/EVTX/MFT/PCAP mechanics → **dfir** skill. This skill consumes its

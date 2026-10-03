@@ -173,6 +173,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && printf '#!/bin/sh\nexec python3 /opt/mac_apt/mac_apt.py "$@"\n' \
         > /usr/local/bin/mac_apt && chmod +x /usr/local/bin/mac_apt
 
+# ---- Visualization assets (incident_viz.py) ---------------------------------
+# Static-format deps and vendored JS. Kept in a late layer so adding them does
+# not invalidate the heavy plaso/Zeek/ClamAV/mac_apt layers above.
+RUN pip3 install --no-cache-dir --break-system-packages matplotlib networkx
+
+# Vendor the JS bundles so rendered HTML is single-file and fully offline.
+# The helper inlines these into each deliverable (no network, no CDN).
+ENV VIS_NETWORK_VER=9.1.9 \
+    VIS_TIMELINE_VER=7.7.3
+RUN mkdir -p /opt/viz-assets \
+    && curl -fsSL -o /opt/viz-assets/vis-network.min.js \
+        "https://unpkg.com/vis-network@${VIS_NETWORK_VER}/standalone/umd/vis-network.min.js" \
+    && curl -fsSL -o /opt/viz-assets/vis-timeline-graph2d.min.js \
+        "https://unpkg.com/vis-timeline@${VIS_TIMELINE_VER}/standalone/umd/vis-timeline-graph2d.min.js" \
+    && curl -fsSL -o /opt/viz-assets/vis-timeline-graph2d.min.css \
+        "https://unpkg.com/vis-timeline@${VIS_TIMELINE_VER}/styles/vis-timeline-graph2d.min.css"
+
+# ---- analysis helper: incident visualization --------------------------------
+RUN printf '#!/bin/sh\nexec python3 /data/tools/incident_viz.py "$@"\n' \
+        > /usr/local/bin/incident_viz && chmod +x /usr/local/bin/incident_viz
+
 # ---- ForensicArtifacts catalog (coverage manifest, not a parser) ------------
 # YAML definitions of artifact locations for Windows/Linux/macOS. Used as a
 # checklist to compare present evidence against known artifact classes.

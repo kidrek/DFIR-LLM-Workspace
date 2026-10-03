@@ -15,6 +15,9 @@ per case; the evidence never leaves the read-only mount.
 | `notes/` | Working notes and scratch. | Yes |
 | `docker/` | Toolchain image (`Dockerfile`) and wrapper (`dfir.sh`). Reusable. | Yes |
 | `skills/` | Agent skill definitions (`dfir`, `incident-handler`). Reusable. | Yes |
+| `.opencode/` | Agent definitions (`incident-handler`) and commands (`reset-case`). Reusable. | Yes |
+| `opencode.jsonc` | OpenCode config: registers `skills/`, auto-starts the Incident Handler. | Yes |
+| `reset_case.sh` | Reset the workspace for a new case (dry-run by default). Reusable. | Yes |
 
 See `CLAUDE.md` for the full workspace guide and hard rules, and
 `AGENTS.md` for the always-on agent summary.
@@ -57,6 +60,31 @@ docker/dfir.sh hayabusa dfir-timeline \
   -o /data/analysis/<HOST>/hayabusa_timeline.csv
 ```
 
+## Reset for a new case
+
+`reset_case.sh` clears the case-specific content (evidence, `analysis/`,
+`reports/`, `notes/`) while preserving the reusable template (`docker/`,
+`skills/`, `.opencode/`, docs, and every `.gitkeep`). It is **dry-run by
+default** — nothing is deleted until you pass `--yes`.
+
+> This deliberately overrides the workspace rule "do not delete evidence". It is
+> a **template reset only**: archive any evidence you still need first, and
+> **never run it on a live case mid-investigation**.
+
+```sh
+./reset_case.sh                  # dry-run: show exactly what would be removed
+./reset_case.sh --yes            # apply the reset
+./reset_case.sh --yes --keep-evidence   # keep evidences/, reset the rest
+./reset_case.sh --yes --scrub-refs      # also genericize leftover case examples
+./reset_case.sh --yes --reset-git       # also rm -rf .git && git init
+```
+
+It auto-detects the case name from `analysis/iocs.json` / the report title, and
+after cleaning scans the reusable tree for residual case references and warns.
+The same operation is available as the slash command **`/reset-case`** inside
+OpenCode (analyst or agent): it runs the dry-run, asks for confirmation, then
+applies. `/reset-case --keep-evidence` passes flags through.
+
 ## Wrapper usage
 
 `docker/dfir.sh` enforces read-only evidence, ephemeral (`--rm`) containers,
@@ -94,6 +122,23 @@ Mounts:
   `Yara-Rules` rule sets under `/opt/yara-rules`, plus the helpers
   `docker/av_triage.py` (YARA/ClamAV scanning) and `docker/av_parse.py`
   (Defender EVTX/text-log normalization).
+- **IOC export:** `docker/ioc_export.py` turns a structured `analysis/iocs.json`
+  (or `.yaml`) observable list into a flat `analysis/iocs.csv` for SIEM/CTI
+  ingestion; `--exclude-benign` yields a threat-intel-only view. Schema in
+  `skills/dfir`.
+- **Visualization:** `docker/incident_viz.py` renders an attack timeline,
+  actor/network graph and MITRE ATT&CK matrix from `analysis/iocs.json`, a
+  normalized timeline CSV (or a Markdown chain table via `--from-markdown`) and
+  Zeek logs. Output is single-file, offline HTML (JS inlined from
+  `/opt/viz-assets`) plus optional static SVG/PNG, written to `reports/viz/`.
+  Example in `skills/dfir`.
+- **Endpoint dashboard:** `docker/incident_dashboard.py` aggregates the same
+  artifacts into **one** self-contained HTML (`reports/dashboard.html`) with a
+  client-side **endpoint filter** across every panel — timeline, actor graph,
+  process tree, observables, IOCs and the ATT&CK matrix — plus an Overview and a
+  global "All endpoints" view. Process trees come from flattened Security 4688
+  (`--proc`), correlated by PID + time so PID reuse across reboots does not
+  merge unrelated processes. See "Endpoint dashboard" below.
 - **Coverage manifest:** `/opt/forensic-artifacts` — the ForensicArtifacts YAML
   catalog of artifact *locations*. It is a checklist, not a parser.
 
@@ -182,6 +227,93 @@ docker/dfir.sh qemu-nbd --read-only -c /dev/nbd0 /data/evidences/disk.vmdk
 > ESXi logs are text, so plaso's generic `syslog` parser does not understand
 > the `Hostd[...]`/`vobd[...]` grammar — `esxi_triage.py` is the parser for
 > this data.
+
+## Incident visualization
+
+`incident_viz.py` renders analyst-facing diagrams from artifacts you have
+already produced — no new parsing, no network. The visuals are **deliverables**,
+so they are written beside the report (default convention `reports/viz/`). It
+reads the structured IOC list, a normalized timeline, and/or Zeek logs and
+writes to `--out`:
+
+- `attack_timeline.{html,svg,png}` — swimlane timeline per host, colored by tag.
+- `actor_graph.{html,svg,png}` — attacker/victim hosts, accounts, payloads and
+  observed network edges (from Zeek `conn`/`http`/`smb_mapping`/`kerberos`/`ntlm`).
+- `mitre_matrix.{html,svg,png}` — ATT&CK tactic grid from the IOCs' `mitre` field.
+- `timeline.csv`, `timeline.json`, `graph.json` — machine-readable intermediates.
+
+```sh
+# From an existing Markdown chain table (bootstraps timeline.csv):
+docker/dfir.sh python3 /data/tools/incident_viz.py \
+  --iocs /data/analysis/iocs.json \
+  --from-markdown /data/reports/incident_timeline.md \
+  --zeek /data/analysis/network/zeek \
+  --out /data/reports/viz --formats html,svg,png
+
+# Once reports/viz/timeline.csv exists, feed it back directly:
+docker/dfir.sh python3 /data/tools/incident_viz.py \
+  --iocs /data/analysis/iocs.json \
+  --timeline /data/reports/viz/timeline.csv \
+  --zeek /data/analysis/network/zeek \
+  --out /data/reports/viz
+```
+
+The HTML is a **single self-contained file** — the vis.js bundles are inlined
+from `/opt/viz-assets` at render time, so it opens in any browser with no
+network and no server. Static `--formats svg,png` are embeddable in the report
+(`matplotlib`/`networkx`). Pass `--date YYYY-MM-DD` when the source report only
+contains bare `HH:MM` times; without it the helper tries to infer the incident
+date from the report and the IOCs.
+
+## Endpoint dashboard
+
+`incident_dashboard.py` combines the timeline, actor graph, process trees,
+observables, IOCs and the ATT&CK matrix into **one** offline HTML with a
+client-side **endpoint filter** — so an analyst can answer "what happened on
+this host?" without cross-referencing separate files. "All endpoints" is the
+global view.
+
+```sh
+docker/dfir.sh python3 /data/tools/incident_dashboard.py \
+  --iocs     /data/analysis/iocs.json \
+  --timeline /data/analysis/timeline_sasync.csv \
+  --zeek     /data/analysis/network/zeek \
+  --proc     /data/analysis/SqlSvr/evtx/Security.tsv \
+  --proc     /data/analysis/DC2/evtx/Security.tsv \
+  --out      /data/reports --title "SaSync / shanocorp.htb"
+```
+
+Outputs `reports/dashboard.html` (self-contained) and
+`reports/dashboard_data.json` (the embedded payload, for reuse).
+
+- **Endpoint filter** — chips for each host; `All endpoints` = global view.
+  Every tab respects it, and there is a free-text search plus a
+  "hide benign/responder" toggle.
+- **Per-endpoint attribution** — observables carry a `hosts: [...]` field;
+  when absent it is inferred from the entry's `source`/`context` text.
+- **Process trees** — built from flattened Security 4688 (`--proc`, repeatable).
+  Parentage is resolved by **PID + time** (parent must not post-date the child),
+  so a PID reused after a reboot does not graft unrelated processes together.
+  Trees keep attacker-relevant processes, their ancestor chain and descendants;
+  identical leaf roots (e.g. 15 `wevtutil cl` calls) are collapsed with ×N.
+- Panels: **Overview**, **Timeline**, **Actor graph**, **Process trees**,
+  **Observables** (all, incl. benign), **IOCs** (benign removed), **ATT&CK**.
+
+
+## Guided analysis (Incident Handler agent)
+
+`opencode.jsonc` registers the template's `skills/` with OpenCode and sets the
+**Incident Handler** primary agent as the default, so a new `opencode` session
+inside a case copy starts in guided mode.
+
+The agent loads `skills/incident-handler`, reads the case task list, and walks
+the analyst through the engagement one step at a time — objective, the exact
+`docker/dfir.sh` command, what to look for, and which task it answers — while
+delegating parsing mechanics to the `dfir` skill. It keeps a running
+`analysis/task_tracking.md` and denies edits under `evidences/`.
+
+To use a different agent for a session, pick it from the agent switcher; the
+default only affects new sessions.
 
 ## Not included
 

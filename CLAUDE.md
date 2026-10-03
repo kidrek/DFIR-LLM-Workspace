@@ -17,6 +17,9 @@ risk from it.
 | `notes/` | Working notes and scratch. | Yes |
 | `docker/` | Toolchain image (`Dockerfile`) and wrapper (`dfir.sh`). Reusable. | Yes |
 | `skills/` | Agent skill definitions (`dfir`, `incident-handler`). Reusable. | Yes |
+| `.opencode/` | Agent definitions and commands (`reset-case`). Project-local; copies with the template. | Yes |
+| `opencode.jsonc` | OpenCode config: registers `skills/` and auto-starts the Incident Handler. | Yes |
+| `reset_case.sh` | Reset the workspace for a new case (dry-run by default). Reusable. | Yes |
 
 `evidences/` is the only place raw data lives. Nothing derived is ever written
 back into it.
@@ -43,6 +46,40 @@ back into it.
 
 ---
 
+## Boundary / security rules
+
+Agents must work **inside this workspace only**. The `permissions` array in
+`opencode.jsonc` enforces this at the OpenCode layer and applies to **every**
+agent (built-ins included); custom agents may append further rules but cannot
+loosen these.
+
+- **Deny by default, outside the project.** The broad rule
+  `external_directory: * → deny` blocks any path outside the working folder and
+  its worktree — parent directories included. This gates `read`, `edit`,
+  `write`, and `patch`, plus the working directory inferred for `shell`.
+- **Managed-location exceptions.** OpenCode's own directories are re-allowed so
+  normal operation keeps working: `~/.config/opencode/*`,
+  `~/.local/share/opencode/*`, `~/.cache/opencode/*`, `~/.opencode/plan/*`
+  (Plan-mode writes), and `/tmp/opencode/*`.
+- **Parent-climb guard.** `read`/`edit` of `../*` are explicitly denied.
+- **Shell escape guard.** Obvious escapes (`cd ..`, `..` arguments, `/etc`,
+  `/root`, `/proc`, `/sys`, `/boot`) are denied. This is a **guardrail, not a
+  sandbox**.
+- **Order matters.** Rules use whole-value wildcards and the **last matching
+  rule wins**, so broad denies precede narrow allows.
+
+### Residual gaps (known, not fully covered)
+
+- `glob`/`grep` search paths are not governed by `external_directory`, so path
+  escapes through those tools are not fully blocked.
+- Shell directory inference from command text is **best-effort**; obfuscated
+  commands can evade text-based shell rules, and shell still runs with the host
+  user's filesystem, process, and network authority.
+- For those reasons, **`docker/dfir.sh` and the container boundary remain the
+  real enforcement**, not these rules. These rules are defense in depth.
+
+---
+
 ## Toolchain
 
 `docker/Dockerfile` builds a self-contained tri-OS image providing:
@@ -64,6 +101,15 @@ back into it.
 - **Antivirus / EDR:** `clamscan` (ClamAV), `yara` + `yara-python`, rule sets at
   `/opt/yara-rules/{signature-base,yara-rules}`; helpers `docker/av_triage.py`
   (YARA/ClamAV) and `docker/av_parse.py` (Defender EVTX/log normalization).
+- **IOC export:** helper `docker/ioc_export.py` — normalizes a structured
+  `analysis/iocs.json`/`.yaml` observable list into `analysis/iocs.csv` (and a
+  `--exclude-benign` threat-intel view). See `skills/dfir` for the schema.
+- **Visualization:** helper `docker/incident_viz.py` — renders an attack
+  timeline, actor/network graph and ATT&CK matrix from `analysis/iocs.json`, a
+  normalized timeline CSV (or a Markdown chain table via `--from-markdown`) and
+  Zeek logs. Visuals are deliverables written beside the report (convention
+  `reports/viz/`): single-file offline HTML (JS inlined from `/opt/viz-assets`)
+  plus optional static SVG/PNG (`matplotlib`/`networkx`).
 - **Utilities:** `jq`, `ripgrep`, `file`, `sha256sum`, `dfir-unfurl`.
 
 `/opt/forensic-artifacts` holds the ForensicArtifacts catalog (YAML definitions
@@ -150,6 +196,18 @@ docker/dfir.sh tshark -r /data/evidences/traffic.pcapng -Y tcp.port==445
 The `docker/` and `skills/` directories are case-independent and can be reused
 verbatim for future cases.
 
+### Reuse via reset
+
+`reset_case.sh` clears case-specific content (`evidences/`, `analysis/`,
+`reports/`, `notes/`) but keeps the reusable template and every `.gitkeep`. It
+is **dry-run by default**; add `--yes` to apply. Flags: `--keep-evidence`,
+`--scrub-refs` (genericize leftover case examples), `--reset-git`. Inside
+OpenCode the same flow is the slash command `/reset-case`.
+
+> This overrides the "do not delete evidence" rule for **template reset only**.
+> Archive any evidence you still need first; never run it on a live case
+> mid-investigation.
+
 ---
 
 ## Skills
@@ -158,3 +216,21 @@ verbatim for future cases.
   EVTX/MFT/PCAP recipes, timeline method, cross-verification.
 - `skills/incident-handler/SKILL.md` — incident response flow, task tracking,
   evidence-citation standard, MITRE ATT&CK mapping, report template.
+
+---
+
+## Incident Handler agent (startup)
+
+`opencode.jsonc` registers `skills/` with OpenCode and sets
+`default_agent: incident-handler`, so new sessions in this workspace start in
+guided Incident Handler mode.
+
+`.opencode/agents/incident-handler.md` defines that primary agent. It loads the
+`incident-handler` skill, reads the case task list, and walks the analyst through
+the engagement flow **one step at a time** (objective → exact `docker/dfir.sh`
+command → what to look for → what it answers), delegating parsing to the `dfir`
+skill. It keeps a running `analysis/task_tracking.md` and denies edits under
+`evidences/`.
+
+The agent is prompt/config guidance, not enforcement: the hard rules above and
+`docker/dfir.sh` remain the actual guardrails.

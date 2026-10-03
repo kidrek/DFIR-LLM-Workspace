@@ -1,0 +1,42 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // The `skills/` directory is the template's reusable skill library.
+  // Registering it here lets OpenCode discover skills/dfir and
+  // skills/incident-handler (the paths are resolved from the working dir).
+  "skills": ["./skills"],
+  // New sessions in this workspace start in guided Incident Handler mode.
+  "default_agent": "incident-handler",
+  // Security boundary: agents work inside this project only. All paths outside
+  // the working folder (including parent directories) are denied by default.
+  // Rules are ordered; the LAST matching rule wins, so broad denies go first
+  // and narrow exceptions follow. These top-level rules apply to every agent
+  // (custom agents such as incident-handler append their own rules after them).
+  "permissions": [
+    // Block every path outside this project by default.
+    { "action": "external_directory", "resource": "*", "effect": "deny" },
+
+    // Re-allow OpenCode's own managed locations so normal tooling still works
+    // (undo/snapshots, saved approvals, Plan-mode writes, tool output).
+    { "action": "external_directory", "resource": "~/.config/opencode/*", "effect": "allow" },
+    { "action": "external_directory", "resource": "~/.local/share/opencode/*", "effect": "allow" },
+    { "action": "external_directory", "resource": "~/.cache/opencode/*", "effect": "allow" },
+    { "action": "external_directory", "resource": "~/.opencode/plan/*", "effect": "allow" },
+    { "action": "external_directory", "resource": "/tmp/opencode/*", "effect": "allow" },
+
+    // Defense in depth: refuse explicit parent-directory climbs in file tools.
+    { "action": "read", "resource": "../*", "effect": "deny" },
+    { "action": "edit", "resource": "../*", "effect": "deny" },
+
+    // Shell: block obvious escapes only. Directory inference from raw command
+    // text is best-effort, so this is a guardrail, not a sandbox; the container
+    // wrapper (docker/dfir.sh) remains the real enforcement boundary.
+    { "action": "shell", "resource": "cd ..*", "effect": "deny" },
+    { "action": "shell", "resource": "* ..*", "effect": "deny" },
+    { "action": "shell", "resource": "../*", "effect": "deny" },
+    { "action": "shell", "resource": "*/etc/*", "effect": "deny" },
+    { "action": "shell", "resource": "*/root/*", "effect": "deny" },
+    { "action": "shell", "resource": "*/proc/*", "effect": "deny" },
+    { "action": "shell", "resource": "*/sys/*", "effect": "deny" },
+    { "action": "shell", "resource": "*/boot/*", "effect": "deny" }
+  ]
+}

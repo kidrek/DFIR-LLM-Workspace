@@ -86,6 +86,9 @@ Mounts:
   `libvmdk-utils`, `p7zip-full`.
 - **Network:** `tshark`, `zeek`.
 - **Memory:** `volatility3`.
+- **ESXi / VMware:** `vmfs-tools`, `vmfs6-tools`, `qemu-utils` (VMFS datastore
+  and VMDK access) plus the helper `docker/esxi_triage.py` (support-bundle log
+  parser, analyser and hunter).
 - **Antivirus / EDR:** `clamscan` (ClamAV, signatures baked in — refresh with
   `freshclam`), `yara` + `yara-python` with the `signature-base` and
   `Yara-Rules` rule sets under `/opt/yara-rules`, plus the helpers
@@ -131,6 +134,54 @@ Handled artifacts (per `skills/dfir/SKILL.md`): `MicrosoftAVLogs`,
 `MicrosoftAVQuarantine` (records), `WindowsDefenderScanDetectionHistoryFiles`,
 `WindowsDefenderExclusions`. **Not decoded:** quarantined/encoded file
 containers (Defender RBRC, Sophos/Symantec/ESET stores) — see "Not included".
+
+## ESXi / VMware analysis
+
+`esxi_triage.py` parses a VMware ESXi support bundle (`vm-support` `.tgz`),
+a bare log directory (`/var/log`, `/var/run/log`) or a single log, producing a
+normalized timeline plus categorized security findings.
+
+```sh
+docker/dfir.sh python3 /data/tools/esxi_triage.py \
+  --out /data/analysis/esxi --datastore /data/evidences/vmfs \
+  /data/evidences/vm-support-XXXX.tgz
+```
+
+Outputs (in `--out`):
+
+- `timeline.csv` — one row per interesting log line (`time_utc`, `source_log`,
+  `line_no`, `component`, `severity`, `category`, `event`, `user`, `src_ip`,
+  `detail`, `raw`).
+- `findings.json` — findings with `CRITICAL`/`HIGH`/`MEDIUM`/`LOW` severity.
+- `summary.txt`, `coverage.json` (which of the `esxi.yaml` artifacts were
+  present), and `av_hits.json`/`av_result.json` when the YARA/ClamAV handoff runs.
+
+Exit code `1` if any `HIGH`/`CRITICAL` finding exists. Detection content:
+
+- **Authentication** — SSH logon/logoff, invalid user/failures, root SSH,
+  WebUI logon (VCSA/`VMware-client` filtered), password changes.
+- **Execution** — `shell.log` commands, `esxcli`, `rhttpproxy` clients, SFTP
+  transfers, `exec denied`, unsigned-binary execution prevented.
+- **Integrity / config** — SSH enable/disable, VIB acceptance-level change,
+  ESXi shell / admin-access toggles, account create/delete.
+- **Ransomware** — extensions (`.esxiargs`, `.babyk`, `.royal`, `.blackbasta`,
+  `.akira`, `.alphv`, `.enc`, `.locked`, …), ransom notes, suspicious scripts
+  (`encrypt.sh`, `ksmd`, `autobackup.bin`), VMDK deletion, and
+  `vmware_local.sh` persistence in `/etc/rc.local.d/`.
+- **VM-escape CVEs** — OpenSLP/427, CD-ROM (CVE-2021-22045), VMCI/vSock
+  (CVE-2022-31696), VMware Tools guest ops/UNC3886 (CVE-2023-20867), USB
+  controller (CVE-2024-22252/3/4).
+
+Mount VMFS datastores / VMDKs read-only for file-level review:
+
+```sh
+docker/dfir.sh vmfs-fuse -o ro /data/evidences/datastore /mnt/vmfs   # 5.x/6.x
+docker/dfir.sh qemu-nbd --read-only -c /dev/nbd0 /data/evidences/disk.vmdk
+```
+
+> ESXi logs are text, so plaso's generic `syslog` parser does not understand
+> the `Hostd[...]`/`vobd[...]` grammar — `esxi_triage.py` is the parser for
+> this data.
 
 ## Not included
 

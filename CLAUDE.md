@@ -59,6 +59,8 @@ back into it.
   `p7zip-full`.
 - **Network:** `tshark`, `zeek`, NTLM extraction.
 - **Memory:** `volatility3`.
+- **ESXi / VMware:** `vmfs-tools`, `vmfs6-tools`, `qemu-utils`; helper
+  `docker/esxi_triage.py` (support-bundle log parser, analyser, hunter).
 - **Antivirus / EDR:** `clamscan` (ClamAV), `yara` + `yara-python`, rule sets at
   `/opt/yara-rules/{signature-base,yara-rules}`; helpers `docker/av_triage.py`
   (YARA/ClamAV) and `docker/av_parse.py` (Defender EVTX/log normalization).
@@ -112,12 +114,14 @@ docker/dfir.sh tshark -r /data/evidences/traffic.pcapng -Y tcp.port==445
    Linux/macOS, all under `analysis/<host>/<source>/`.
 4. **AV/EDR** — normalize Defender telemetry (`av_parse.py`) and scan recovered
    files with YARA/ClamAV (`av_triage.py`) into `analysis/<host>/av/`.
-5. **Correlate** — build a super-timeline; cross-verify every finding against a
+5. **ESXi** — parse/hunt `vm-support` bundles with `esxi_triage.py` into
+   `analysis/esxi/`; mount VMFS/VMDK read-only for file review.
+6. **Correlate** — build a super-timeline; cross-verify every finding against a
    second independent artifact (e.g. process creation vs. network connection vs.
    file timestamp).
-6. **Answer** — map findings to the case task list, citing the exact source
+7. **Answer** — map findings to the case task list, citing the exact source
    record.
-7. **Report** — write the deliverable to `reports/`.
+8. **Report** — write the deliverable to `reports/`.
 
 ---
 

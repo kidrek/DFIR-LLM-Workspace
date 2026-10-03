@@ -39,6 +39,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libvmdk-utils \
         libvslvm-utils \
         libbde-utils \
+        vmfs-tools vmfs6-tools qemu-utils \
         util-linux \
         clamav \
         jq ripgrep file less vim-tiny \
@@ -181,6 +182,12 @@ RUN git clone --depth 1 https://github.com/ForensicArtifacts/artifacts.git /opt/
 # ---- analysis helper: dump one EVTX to JSONL with evtx_dump ------------------
 RUN printf '#!/bin/sh\n# usage: evtx2json <file.evtx> [out.jsonl]\nexec evtx_dump_rs -o jsonl "$@"\n' \
         > /usr/local/bin/evtx2json && chmod +x /usr/local/bin/evtx2json
+
+# ---- ESXi triage helper -----------------------------------------------------
+# Parse/hunt VMware ESXi support bundles. The script itself is mounted from
+# docker/ at /data/tools/; this creates a PATH entry for convenience.
+RUN printf '#!/bin/sh\nexec python3 /data/tools/esxi_triage.py "$@"\n' \
+        > /usr/local/bin/esxi_triage && chmod +x /usr/local/bin/esxi_triage
 
 # Output ownership: run as the caller's uid/gid (see docker/dfir.sh)
 WORKDIR /data

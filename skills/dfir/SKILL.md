@@ -27,6 +27,8 @@ Use `docker/dfir.sh` (see workspace `CLAUDE.md`). Image: `dfir-toolkit`.
   `p7zip-full`
 - Network: `tshark`, `zeek`
 - Memory: `volatility3`
+- ESXi / VMware: `vmfs-fuse`/`vmfs6-fuse`, `qemu-nbd`; helper
+  `docker/esxi_triage.py`
 - Antivirus / EDR: `clamscan` (ClamAV), `yara`/`yara-python`, rule sets at
   `/opt/yara-rules/{signature-base,yara-rules}`; helpers `docker/av_triage.py`,
   `docker/av_parse.py`
@@ -60,9 +62,38 @@ Use `docker/dfir.sh` (see workspace `CLAUDE.md`). Image: `dfir-toolkit`.
    `zeek -r pcap` (gives `http`, `smb_mapping`, `kerberos`, `dce_rpc`, `pe`,
    `files`, `ntlm`, `ldap_search`).
 9. **Antivirus / EDR** (see below).
-10. **Correlate**: every finding is confirmed by a second artefact
+10. **ESXi / VMware** (see below).
+11. **Correlate**: every finding is confirmed by a second artefact
     (process-create ↔ network connection ↔ file timestamp ↔ auth event).
-11. **Timeline** into `analysis/<host>/…`; **report** into `reports/`.
+12. **Timeline** into `analysis/<host>/…`; **report** into `reports/`.
+
+## ESXi / VMware analysis
+Artifacts (ForensicArtifacts `esxi.yaml`): `hostd.log`, `vmkernel.log`,
+`shell.log`, `auth.log`, `syslog.log`, `vobd`, `esxcli`, `rhttpproxy`,
+`vmksummarylog.log`, `vmkwarning.log`, `vxpa.log`, etc., collected via
+`vm-support` (bundle at `/scratch/…tgz`) or `/var/log`,`/var/run/log`.
+
+- Parse + hunt a support bundle:
+  ```sh
+  docker/dfir.sh python3 /data/tools/esxi_triage.py \
+    --out /data/analysis/esxi --datastore /data/evidences/vmfs \
+    /data/evidences/vm-support-*.tgz
+  ```
+  Outputs `timeline.csv`, `findings.json`, `summary.txt`, `coverage.json`
+  (present vs. missing `esxi.yaml` artifacts). Exit `1` on HIGH/CRITICAL.
+- Key detection categories: SSH/WebUI auth, `shell.log` commands and `esxcli`,
+  SSH enable/disable, VIB acceptance-level change, account create/delete,
+  ransomware extensions/notes/scripts, `vmware_local.sh` persistence, and
+  VM-escape CVEs (OpenSLP/427, CD-ROM, VMCI/vSock, Tools guest-ops, USB).
+- Mount datastore / VMDK read-only for file review:
+  ```sh
+  docker/dfir.sh vmfs-fuse -o ro /data/evidences/datastore /mnt/vmfs
+  docker/dfir.sh qemu-nbd --read-only -c /dev/nbd0 /data/evidences/disk.vmdk
+  ```
+- Answer the ESXi ransomware question directly: check for `.esxiargs`/`.locked`
+  files, `HOW_TO_RESTORE*` notes, and encrypted `.vmdk` on the datastore.
+- ESXi logs are text; plaso's `syslog` parser does not understand the
+  `Hostd[...]`/`vobd[...]` grammar — use `esxi_triage.py`.
 
 ## Antivirus / EDR analysis
 Handled catalog artifacts: `MicrosoftAVLogs`, `MicrosoftAVQuarantine`

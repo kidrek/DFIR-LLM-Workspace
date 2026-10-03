@@ -40,6 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libvslvm-utils \
         libbde-utils \
         util-linux \
+        clamav \
         jq ripgrep file less vim-tiny \
         binutils \
         libicu74 \
@@ -116,7 +117,12 @@ RUN pip3 install --no-cache-dir --break-system-packages \
         dfir-unfurl
 
 # ---- plaso (super-timeline engine; large install, kept as its own layer) ----
-RUN pip3 install --no-cache-dir --break-system-packages plaso
+# Plaso installs console scripts without the .py suffix; add the conventional
+# aliases so `log2timeline.py`/`psort.py` (as used in docs) also work.
+RUN pip3 install --no-cache-dir --break-system-packages plaso \
+    && ln -sf /usr/local/bin/log2timeline /usr/local/bin/log2timeline.py \
+    && ln -sf /usr/local/bin/psort /usr/local/bin/psort.py \
+    && ln -sf /usr/local/bin/pinfo /usr/local/bin/pinfo.py
 
 # ---- Zeek (network logs: mssql, smb, dce_rpc, kerberos, http) ---------------
 RUN . /etc/os-release \
@@ -128,13 +134,43 @@ RUN . /etc/os-release \
     && ln -sf /opt/zeek/bin/zeek /usr/local/bin/zeek \
     && ln -sf /opt/zeek/bin/zeek-cut /usr/local/bin/zeek-cut || true
 
+# ---- YARA rule sets (signature-base + Yara-Rules) ---------------------------
+# Used by `yara`, `yara-python`, and docker/av_triage.py. Individual rule files
+# are compiled by the helper; invalid/unsupported rules are skipped gracefully.
+RUN git clone --depth 1 https://github.com/Neo23x0/signature-base.git \
+        /opt/yara-rules/signature-base \
+    && git clone --depth 1 https://github.com/Yara-Rules/rules.git \
+        /opt/yara-rules/yara-rules \
+    && rm -rf /opt/yara-rules/*/.git
+
+# ---- ClamAV signature database ----------------------------------------------
+# `clamscan` from the base layer has no signatures. Fetch the CVD database at
+# build time so the image is usable offline; refresh later with `freshclam`.
+# The clamd/clamav-daemon layer is not installed (only the CLI scanner is used).
+RUN freshclam --quiet || true \
+    && rm -rf /var/lib/clamav/*.sign \
+    && ls -la /var/lib/clamav
+
 # ---- mac_apt (macOS plists, unified logs, FSEvents, SQLite artifacts) -------
-# Optional: APOLLO is deliberately omitted (Swift toolchain is heavy); add it
-# as a separate layer if unified-archive parsing is required.
-RUN git clone --depth 1 https://github.com/ydkhatri/mac_apt.git /opt/mac_apt \
+# mac_apt runs from source (no setup.py). Notes:
+#  * pyaff4 depends on the broken `fastchunking` sdist; install pybindgen first
+#    so its C++ binding generates, then build fastchunking without isolation.
+#  * mac_apt pins pytsk3==20230125, which fails to link libbfio and conflicts
+#    with plaso (needs >=20260715). Reinstall newer pytsk3 last so both work.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libtsk-dev libbfio-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && git clone --depth 1 https://github.com/ydkhatri/mac_apt.git /opt/mac_apt \
     && rm -rf /opt/mac_apt/.git \
-    && pip3 install --no-cache-dir --break-system-packages /opt/mac_apt \
-    && ln -sf /opt/mac_apt/mac_apt.py /usr/local/bin/mac_apt || true
+    && pip3 install --no-cache-dir --break-system-packages pybindgen==0.21.0 \
+    && pip3 install --no-cache-dir --break-system-packages --no-build-isolation \
+        "fastchunking==0.0.3" \
+    && cd /opt/mac_apt \
+    && pip3 install --no-cache-dir --break-system-packages -r requirements.txt \
+    && pip3 install --no-cache-dir --break-system-packages --force-reinstall \
+        "pytsk3>=20260715" \
+    && printf '#!/bin/sh\nexec python3 /opt/mac_apt/mac_apt.py "$@"\n' \
+        > /usr/local/bin/mac_apt && chmod +x /usr/local/bin/mac_apt
 
 # ---- ForensicArtifacts catalog (coverage manifest, not a parser) ------------
 # YAML definitions of artifact locations for Windows/Linux/macOS. Used as a

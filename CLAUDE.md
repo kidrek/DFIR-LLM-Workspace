@@ -59,6 +59,9 @@ back into it.
   `p7zip-full`.
 - **Network:** `tshark`, `zeek`, NTLM extraction.
 - **Memory:** `volatility3`.
+- **Antivirus / EDR:** `clamscan` (ClamAV), `yara` + `yara-python`, rule sets at
+  `/opt/yara-rules/{signature-base,yara-rules}`; helpers `docker/av_triage.py`
+  (YARA/ClamAV) and `docker/av_parse.py` (Defender EVTX/log normalization).
 - **Utilities:** `jq`, `ripgrep`, `file`, `sha256sum`, `dfir-unfurl`.
 
 `/opt/forensic-artifacts` holds the ForensicArtifacts catalog (YAML definitions
@@ -107,12 +110,14 @@ docker/dfir.sh tshark -r /data/evidences/traffic.pcapng -Y tcp.port==445
 3. **Parse** — export per-source EVTX to JSON, `$MFT` to CSV, PCAP to Zeek
    logs, registry hives to CSV, and build a `plaso` super-timeline for
    Linux/macOS, all under `analysis/<host>/<source>/`.
-4. **Correlate** — build a super-timeline; cross-verify every finding against a
+4. **AV/EDR** — normalize Defender telemetry (`av_parse.py`) and scan recovered
+   files with YARA/ClamAV (`av_triage.py`) into `analysis/<host>/av/`.
+5. **Correlate** — build a super-timeline; cross-verify every finding against a
    second independent artifact (e.g. process creation vs. network connection vs.
    file timestamp).
-5. **Answer** — map findings to the case task list, citing the exact source
+6. **Answer** — map findings to the case task list, citing the exact source
    record.
-6. **Report** — write the deliverable to `reports/`.
+7. **Report** — write the deliverable to `reports/`.
 
 ---
 

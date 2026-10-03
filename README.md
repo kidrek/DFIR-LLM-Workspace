@@ -86,10 +86,57 @@ Mounts:
   `libvmdk-utils`, `p7zip-full`.
 - **Network:** `tshark`, `zeek`.
 - **Memory:** `volatility3`.
+- **Antivirus / EDR:** `clamscan` (ClamAV, signatures baked in — refresh with
+  `freshclam`), `yara` + `yara-python` with the `signature-base` and
+  `Yara-Rules` rule sets under `/opt/yara-rules`, plus the helpers
+  `docker/av_triage.py` (YARA/ClamAV scanning) and `docker/av_parse.py`
+  (Defender EVTX/text-log normalization).
 - **Coverage manifest:** `/opt/forensic-artifacts` — the ForensicArtifacts YAML
   catalog of artifact *locations*. It is a checklist, not a parser.
+
+## Antivirus / EDR analysis
+
+Two helpers cover AV work. Both read evidence read-only and write only to
+`analysis/`.
+
+**1. File-level scanning** (`av_triage.py`) — YARA against the vendored rule
+sets and an optional ClamAV signature scan:
+
+```sh
+docker/dfir.sh python3 /data/tools/av_triage.py \
+  --clamav --json /data/analysis/av/yara_hits.json \
+  /data/evidences/<HOST>
+```
+
+Exit code `1` means matches were found. Rule sets live at
+`/opt/yara-rules/{signature-base,yara-rules}`; override with `--rules DIR`.
+ClamAV ships with a signature database baked into the image (refresh it with
+`docker/dfir.sh freshclam` when network is enabled).
+
+**2. AV telemetry normalization** (`av_parse.py`) — Windows Defender
+operational records and `MPLog-*.log`/`MPDetection-*.log` into a flat TSV:
+
+```sh
+# EVTX -> JSONL first
+docker/dfir.sh evtx_dump_rs -o jsonl \
+  '/data/evidences/<HOST>/C/ProgramData/Microsoft/Windows Defender/Operational.evtx' \
+  > /data/analysis/<HOST>/defender_operational.jsonl
+docker/dfir.sh python3 /data/tools/av_parse.py \
+  --out /data/analysis/<HOST>/av_timeline.tsv \
+  /data/analysis/<HOST>/defender_operational.jsonl \
+  '/data/evidences/<HOST>/C/ProgramData/Microsoft/Windows Defender/Support/MPLog-*.log'
+```
+
+Handled artifacts (per `skills/dfir/SKILL.md`): `MicrosoftAVLogs`,
+`MicrosoftAVQuarantine` (records), `WindowsDefenderScanDetectionHistoryFiles`,
+`WindowsDefenderExclusions`. **Not decoded:** quarantined/encoded file
+containers (Defender RBRC, Sophos/Symantec/ESET stores) — see "Not included".
 
 ## Not included
 
 - **APOLLO** (macOS unified-archive parsing) — omitted to avoid the Swift
   toolchain. Add it as a separate Docker layer if needed.
+- **AV quarantine decoders** — encoded quarantine containers (Windows Defender
+  `RBRC`/resource-data, Sophos, Symantec, ESET, CrowdStrike) are not decoded.
+  AV *logs, detections and exclusions* are handled; recovering the quarantined
+  file bytes is not.

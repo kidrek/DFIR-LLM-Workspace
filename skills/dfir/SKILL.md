@@ -27,6 +27,9 @@ Use `docker/dfir.sh` (see workspace `CLAUDE.md`). Image: `dfir-toolkit`.
   `p7zip-full`
 - Network: `tshark`, `zeek`
 - Memory: `volatility3`
+- Antivirus / EDR: `clamscan` (ClamAV), `yara`/`yara-python`, rule sets at
+  `/opt/yara-rules/{signature-base,yara-rules}`; helpers `docker/av_triage.py`,
+  `docker/av_parse.py`
 - Coverage manifest: `/opt/forensic-artifacts` (ForensicArtifacts YAML catalog)
 - Helpers: `docker/evtx_flatten.py` (EVTX JSONL → TSV timeline)
 
@@ -56,9 +59,36 @@ Use `docker/dfir.sh` (see workspace `CLAUDE.md`). Image: `dfir-toolkit`.
 8. **Network**: `tshark -r pcap ...`, `--export-objects http,<dir>`,
    `zeek -r pcap` (gives `http`, `smb_mapping`, `kerberos`, `dce_rpc`, `pe`,
    `files`, `ntlm`, `ldap_search`).
-9. **Correlate**: every finding is confirmed by a second artefact
-   (process-create ↔ network connection ↔ file timestamp ↔ auth event).
-10. **Timeline** into `analysis/<host>/…`; **report** into `reports/`.
+9. **Antivirus / EDR** (see below).
+10. **Correlate**: every finding is confirmed by a second artefact
+    (process-create ↔ network connection ↔ file timestamp ↔ auth event).
+11. **Timeline** into `analysis/<host>/…`; **report** into `reports/`.
+
+## Antivirus / EDR analysis
+Handled catalog artifacts: `MicrosoftAVLogs`, `MicrosoftAVQuarantine`
+(records), `WindowsDefenderScanDetectionHistoryFiles`,
+`WindowsDefenderExclusions`, plus generic Sophos/Symantec/ESET/CrowdStrike
+**logs**. Encoded quarantine **containers are not decoded** (see workspace
+README).
+
+- Normalize Defender telemetry (Operational EVTX JSONL + MPLog/MPDetection):
+  ```sh
+  docker/dfir.sh python3 /data/tools/av_parse.py \
+    --out /data/analysis/<HOST>/av_timeline.tsv <defender.jsonl> <MPLog-*.log>
+  ```
+- Scan files/directories with YARA + ClamAV:
+  ```sh
+  docker/dfir.sh python3 /data/tools/av_triage.py --clamav \
+    --json /data/analysis/<HOST>/av/yara_hits.json /data/evidences/<HOST>
+  ```
+  Exit code `1` = matches found. Rule sets: `/opt/yara-rules/`.
+- Defender operational relevance: `1116`/`1006` detection, `1117`/`1007` action,
+  `1118`/`1008` action failed, `5001` real-time protection disabled,
+  `5004`/`5007` config change (watch exclusions), `5010`/`5012` scan failed.
+- Anti-forensics flip side: check `WindowsDefenderExclusions` (registry) and
+  `5007` config-change events for attacker-added exclusion paths.
+- Quarantined/deleted originals: pivot to `$MFT`/USN (`$J`) and `$Recycle.Bin`
+  to recover or prove existence of AV-handled files.
 
 ## Query recipes
 - Process creation (Security 4688) with parent PID:

@@ -1,0 +1,51 @@
+{
+  "_comment": "REFERENCE ONLY -- never loaded by any tool. Generic example of the analysis/iocs.json schema, including the optional endpoints inventory. Replace every value with real case data.",
+  "case": "ACME / example.local",
+  "endpoints": {
+    "10.0.0.5":  {"name": "Attacker", "role": "attacker", "order": 1},
+    "10.0.0.10": {"name": "FILE01",   "role": "victim",   "order": 2},
+    "10.0.0.20": {"name": "DC01",     "role": "victim",   "order": 3}
+  },
+  "observables": [
+    {
+      "type": "ipv4",
+      "value": "10.0.0.5",
+      "defanged": "10[.]0[.]0[.]5",
+      "role": "attacker-host",
+      "first_seen_utc": "2026-01-01T00:00:00Z",
+      "last_seen_utc": "2026-01-01T01:00:00Z",
+      "confidence": "high",
+      "source": "pcap",
+      "context": "external attacker host",
+      "mitre": "T1595,T1190",
+      "tags": ["attacker", "c2"],
+      "hosts": ["Attacker"]
+    },
+    {
+      "type": "ipv4",
+      "value": "10.0.0.20",
+      "defanged": "10[.]0[.]0[.]20",
+      "role": "victim-host",
+      "first_seen_utc": "2026-01-01T00:10:00Z",
+      "last_seen_utc": "2026-01-01T00:40:00Z",
+      "confidence": "high",
+      "source": "Security EID=4624",
+      "context": "domain controller",
+      "mitre": "T1078",
+      "tags": [],
+      "hosts": ["DC01"]
+    },
+    {
+      "type": "file-path",
+      "value": "C:\\Windows\\Temp\\example.exe",
+      "defanged": "C:\\Windows\\Temp\\example[.]exe",
+      "role": "payload",
+      "confidence": "medium",
+      "source": "$MFT",
+      "context": "dropped payload",
+      "mitre": "T1105",
+      "tags": ["payload"],
+      "hosts": ["FILE01"]
+    }
+  ]
+}

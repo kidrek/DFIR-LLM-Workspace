@@ -126,8 +126,21 @@ Mounts:
   (Defender EVTX/text-log normalization).
 - **IOC export:** `docker/ioc_export.py` turns a structured `analysis/iocs.json`
   (or `.yaml`) observable list into a flat `analysis/iocs.csv` for SIEM/CTI
-  ingestion; `--exclude-benign` yields a threat-intel-only view. Schema in
-  `skills/dfir`.
+  ingestion; `--exclude-benign` yields a threat-intel-only view. The optional
+  `endpoints` block names hosts and sets dashboard ordering. Schema in
+  `skills/dfir`; reference example (never loaded) in
+  `skills/dfir/examples/iocs.example.json`.
+- **Artifact queries:** three case-free helpers speed up fact extraction —
+  `docker/evtx_query.py` (filter a flattened EVTX TSV by EID/time/field/regex),
+  `docker/mft_query.py` (query MFTECmd `$MFT` **or** `$J`/USN CSV by
+  name/extension/time/reason), and `docker/pcap_objects.py` (carve protocol
+  objects from a PCAP with `tshark` and emit a SHA-256 manifest).
+- **Case signatures:** the tools contain **no case-specific patterns**. Any
+  engagement-specific detection pattern (random dropper names, responder
+  tooling, actor aliases) goes in an optional `analysis/signatures.json`,
+  auto-loaded when present (`--signatures PATH` to override). Wiping `analysis/`
+  on reset means it never survives into the next case. See
+  `skills/dfir/examples/signatures.example.json`.
 - **Visualization:** `docker/incident_viz.py` renders an attack timeline,
   actor/network graph and MITRE ATT&CK matrix from `analysis/iocs.json`, a
   normalized timeline CSV (or a Markdown chain table via `--from-markdown`) and
@@ -249,11 +262,11 @@ complementary views:
 
 ```sh
 docker/dfir.sh linux_proctree \
-  --snapshot /data/analysis/extracted/app01/catscale_out/Process_and_Network \
-  --logdir   /data/analysis/extracted/app01/catscale_out \
-  --host app01 --tz "+02:00" \
+  --snapshot /data/analysis/extracted/<HOST>/catscale_out/Process_and_Network \
+  --logdir   /data/analysis/extracted/<HOST>/catscale_out \
+  --host <HOST> --tz "+02:00" \
   --since 2025-12-26T00:40:00Z --until 2025-12-26T05:30:00Z \
-  --out /data/analysis/app01/proctree --title "app01 process tree" \
+  --out /data/analysis/<HOST>/proctree --title "<HOST> process tree" \
   --formats json,csv,dot,html,svg,png
 ```
 
@@ -311,15 +324,31 @@ global view.
 ```sh
 docker/dfir.sh python3 /data/tools/incident_dashboard.py \
   --iocs     /data/analysis/iocs.json \
-  --timeline /data/analysis/timeline_sasync.csv \
+  --timeline /data/analysis/timeline.csv \
   --zeek     /data/analysis/network/zeek \
-  --proc     /data/analysis/SqlSvr/evtx/Security.tsv \
-  --proc     /data/analysis/DC2/evtx/Security.tsv \
-  --out      /data/reports --title "SaSync / shanocorp.htb"
+  --proc     /data/analysis/<HOST>/evtx/Security.tsv \
+  --proc     /data/analysis/<HOST2>/evtx/Security.tsv \
+  --out      /data/reports --title "Incident report"
 ```
 
-Outputs `reports/dashboard.html` (self-contained) and
-`reports/dashboard_data.json` (the embedded payload, for reuse).
+Outputs `reports/dashboard.html`, ``reports/report.html`` and
+`reports/dashboard_data.json` (the embedded payload, for reuse). `--layout`
+selects `dashboard` (tabbed), `document` (single-scroll report) or `both`
+(default).
+
+Two complementary all-in-one layouts are produced from the same data:
+
+- **`dashboard.html` (tabbed)** — the narrative Markdown report as a leading
+  **Report** tab (pass `--report-md /data/reports/incident_report.md`;
+  headings/tables/blockquotes/lists render and relative images are inlined as
+  data URIs; `--report-base` overrides the image directory).
+- **`report.html` (document)** — the report rendered inline followed by every
+  data section in one scrolling page (Overview, Timeline, Actor graph, Process
+  trees, Observables, IOCs, ATT&CK), a sticky table-of-contents with
+  scroll-spy, and a **filter bar per section** (endpoint **chips**, free-text
+  search, hide-benign) so each graph can be scoped independently. Pass
+  `--embed name=path` to drop an extra self-contained HTML (e.g. the standalone
+  `proctree.html`) in as an `<iframe srcdoc>` section.
 
 - **Endpoint filter** — chips for each host; `All endpoints` = global view.
   Every tab respects it, and there is a free-text search plus a
@@ -353,6 +382,35 @@ delegating parsing mechanics to the `dfir` skill. It keeps a running
 
 To use a different agent for a session, pick it from the agent switcher; the
 default only affects new sessions.
+
+### Example session
+
+Start the default **Incident Handler** agent and give it the case prompt:
+
+> Analyse the evidence and produce an incident timeline.
+
+The agent then walks the engagement one step at a time; for this prompt it
+suggests:
+
+1. **Intake** — read `evidences/Questions.md`, inventory hosts and evidence
+   types, and open `analysis/task_tracking.md`.
+2. **Chain of custody** — SHA-256 every evidence file into `analysis/hashes/`
+   (before and after analysis).
+3. **Triage** — Hayabusa/Chainsaw Sigma + ATT&CK pass per host; separate
+   adversary activity from responder/forensic-tool activity.
+4. **Parse** — export per-source EVTX to JSON, `$MFT` to CSV, PCAP to Zeek,
+   registry hives to CSV, and build a `plaso` super-timeline.
+5. **Correlate** — consolidate a UTC super-timeline and cross-verify each
+   finding against a second independent artifact (log ↔ PCAP ↔ `$MFT`).
+6. **Timeline** — assemble the consolidated UTC attack chain (the incident
+   timeline deliverable).
+7. **Visualize / dashboard** — render `reports/viz/*` and
+   `reports/dashboard.html` from `analysis/iocs.json`, the timeline and Zeek.
+8. **Report** — write the deliverable to `reports/` with per-task answers,
+   evidence citations, defanged IOCs, ATT&CK mapping and gaps/unknowns.
+
+Each step is presented as **Objective → exact `docker/dfir.sh` command → what
+to look for → what it concludes and the next step**.
 
 ## Not included
 

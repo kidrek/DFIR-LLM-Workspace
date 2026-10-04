@@ -107,6 +107,9 @@ loosen these.
 - **IOC export:** helper `docker/ioc_export.py` — normalizes a structured
   `analysis/iocs.json`/`.yaml` observable list into `analysis/iocs.csv` (and a
   `--exclude-benign` threat-intel view). See `skills/dfir` for the schema.
+- **Queries:** `docker/evtx_query.py` (filtered extraction from a flattened
+  EVTX TSV), `docker/mft_query.py` (query MFTECmd `$MFT`/`$J` CSV),
+  `docker/pcap_objects.py` (carve + SHA-256-hash protocol objects from a PCAP).
 - **Visualization:** helper `docker/incident_viz.py` — renders an attack
   timeline, actor/network graph and ATT&CK matrix from `analysis/iocs.json`, a
   normalized timeline CSV (or a Markdown chain table via `--from-markdown`) and

@@ -30,7 +30,7 @@ Usage::
         --from-markdown /data/reports/incident_timeline.md \
         --zeek     /data/analysis/network/zeek \
         --out      /data/reports/viz \
-        --title    "SaSync / shanocorp.htb" \
+        --title    "<case name>" \
         --formats  html,svg,png
 
 Only matplotlib/networkx (static formats) are optional; the script degrades
@@ -48,7 +48,21 @@ import sys
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 
+try:
+    import dfir_signatures as siglib  # optional, per-case detection patterns
+except Exception:  # noqa: BLE001
+    siglib = None
+
 UTC = timezone.utc
+
+# Optional per-case signatures; absent -> generic behaviour only.
+SIGNATURES = siglib.load_signatures() if siglib else {"actor_keywords": {}}
+
+
+def set_signatures(path: str = "") -> None:
+    global SIGNATURES
+    if siglib is not None:
+        SIGNATURES = siglib.load_signatures(path)
 
 # --------------------------------------------------------------------------- #
 # constants
@@ -307,10 +321,13 @@ def timeline_from_markdown(path: str, date: tuple[int, int, int]) -> list[dict]:
         host = cell(hi)
         actor = cell(ai)
         if not actor:
-            if re.search(r"responder|forensic collection|ftk|exterro", blob, re.I):
-                actor = "Responder"
-            elif "kali" in blob.lower() or "attacker" in blob.lower():
-                actor = "Attacker (Kali)"
+            # derive from the optional per-case actor_keywords map; otherwise a
+            # neutral label. No case-specific keyword is built in.
+            low = blob.lower()
+            for role, kws in (SIGNATURES.get("actor_keywords") or {}).items():
+                if any(str(k).lower() in low for k in kws):
+                    actor = role
+                    break
             else:
                 actor = "System"
         out.append({
@@ -824,10 +841,15 @@ def main(argv=None) -> int:
     ap.add_argument("--date", default="", help="override date YYYY-MM-DD for bare times")
     ap.add_argument("--formats", default="html,svg",
                     help="comma list: html,svg,png (default html,svg)")
+    ap.add_argument("--signatures", default="",
+                    help="optional per-case signatures JSON (default: "
+                         "analysis/signatures.json if present)")
     args = ap.parse_args(argv)
 
     formats = [f.strip().lower() for f in args.formats.split(",") if f.strip()]
     os.makedirs(args.out, exist_ok=True)
+
+    set_signatures(args.signatures)
 
     # date context for bare HH:MM times
     date_ctx = datetime.now(UTC).timetuple()[:3]

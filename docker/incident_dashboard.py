@@ -4,8 +4,12 @@
 Part of the container-only DFIR workspace. Aggregates already-produced artifacts
 into a SINGLE offline HTML file:
 
-  --iocs        structured observables (analysis/iocs.json; `hosts` field used
-                for per-endpoint attribution)
+  --iocs        structured observables (analysis/iocs.json; the optional
+                `endpoints` block and per-observable `hosts` drive endpoint
+                attribution)
+  --signatures  optional per-case signatures JSON (default:
+                analysis/signatures.json if present). Absent -> generic rules
+                only; nothing case-specific is ever built in.
   --timeline    normalized timeline CSV (time_utc,host,actor,event,...)
   --graph       prebuilt graph.json (nodes/edges) -- optional; rebuilt from IOCs
                 + Zeek if omitted
@@ -47,6 +51,10 @@ try:
     import linux_proctree as lpt  # reuse Linux interest heuristic
 except Exception:  # noqa: BLE001
     lpt = None
+try:
+    import dfir_signatures as siglib  # optional, per-case detection patterns
+except Exception:  # noqa: BLE001
+    siglib = None
 
 # local fallbacks if incident_viz is missing ---------------------------------- #
 TACTIC_ORDER = getattr(viz, "TACTIC_ORDER", [
@@ -60,6 +68,205 @@ TAG_COLORS = getattr(viz, "TAG_COLORS", {})
 TYPE_COLORS = getattr(viz, "TYPE_COLORS", {})
 DEFAULT_COLOR = getattr(viz, "DEFAULT_COLOR", "#3498db")
 MITRE_RE = re.compile(r"\bT\d{4}(?:\.\d{3})?\b")
+
+# --------------------------------------------------------------------------- #
+# injection guardrails (evidence is untrusted data, never instructions)
+# --------------------------------------------------------------------------- #
+_SAFE_LINK_SCHEMES = ("http://", "https://", "mailto:")
+_SAFE_IMG_EXT = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".bmp", ".avif")
+_SCRIPT_UNSAFE = {"<": "\\u003c", ">": "\\u003e", "&": "\\u0026",
+                  "\u2028": "\\u2028", "\u2029": "\\u2029"}
+
+
+def json_for_script(obj) -> str:
+    """Serialise to JSON safe to embed inside an inline <script> block.
+
+    json.dumps does NOT escape ``</script>``, so a collected string like
+    ``</script><img src=x onerror=...>`` would break out of the script element.
+    Escaping ``<``/``>``/``&`` (and the JS line separators) keeps the payload
+    inert as data.
+    """
+    out = json.dumps(obj, ensure_ascii=False)
+    for bad, good in _SCRIPT_UNSAFE.items():
+        out = out.replace(bad, good)
+    return out
+
+
+def safe_href(url: str) -> str:
+    """Return a whitelisted href, or '' if the scheme is not allowed.
+
+    Blocks javascript:/data:/vbscript: and other executable schemes so a link
+    from collected data cannot run code when clicked.
+    """
+    u = (url or "").strip()
+    low = u.lower()
+    if low.startswith(_SAFE_LINK_SCHEMES):
+        return u
+    if low.startswith("#") or low.startswith("/") or low.startswith("./") \
+            or low.startswith("../"):
+        return u
+    # a bare relative path with no scheme (no ':' before the first '/')
+    if ":" not in u.split("/", 1)[0]:
+        return u
+    return ""
+
+
+def safe_img_src(src: str) -> str:
+    """Only local image files are inlined; reject data:/http(s):/other schemes."""
+    s = (src or "").strip()
+    if not s or ":" in s.split("/", 1)[0]:
+        return ""
+    return s
+
+
+# --------------------------------------------------------------------------- #
+# Markdown report renderer (stdlib; covers the report's feature set)
+# --------------------------------------------------------------------------- #
+_MD_IMG = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+_MD_LINK = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+_MD_INLINE = re.compile(r"`([^`]+)`|\*\*([^*]+)\*\*|\*([^*]+)\*")
+
+
+def _md_inline(text: str) -> str:
+    # protect image/link targets before escaping the rest of the text
+    tokens: list[str] = []
+
+    def stash(html_snippet: str) -> str:
+        tokens.append(html_snippet)
+        return f"\x00{len(tokens) - 1}\x00"
+
+    def img_repl(m):
+        src = safe_img_src(m.group(2))
+        if not src:
+            return html.escape(m.group(0), quote=False)  # inert literal text
+        return stash(f'<img src="{html.escape(src, quote=True)}" '
+                     f'alt="{html.escape(m.group(1), quote=True)}">')
+
+    def link_repl(m):
+        href = safe_href(m.group(2))
+        if not href:
+            # display the untrusted link as plain text, not a live <a href>
+            return html.escape(m.group(0), quote=False)
+        return stash(f'<a href="{html.escape(href, quote=True)}" '
+                     f'rel="noopener noreferrer" target="_blank">'
+                     f'{html.escape(m.group(1))}</a>')
+
+    text = _MD_IMG.sub(img_repl, text)
+    text = _MD_LINK.sub(link_repl, text)
+
+    text = html.escape(text, quote=False)
+    text = _MD_INLINE.sub(
+        lambda m: (f"<code>{m.group(1)}</code>" if m.group(1) is not None
+                   else f"<strong>{m.group(2)}</strong>" if m.group(2) is not None
+                   else f"<em>{m.group(3)}</em>"), text)
+    return re.sub(r"\x00(\d+)\x00", lambda m: tokens[int(m.group(1))], text)
+
+
+def render_markdown(md: str, base_dir: str = "") -> str:
+    """Minimal Markdown -> HTML for the incident report.
+
+    Handles headings, tables, blockquotes, fenced code, hr, ordered/unordered
+    lists and inline code/bold/italic/images/links. Image paths are resolved
+    relative to ``base_dir`` and inlined as data URIs so the output stays a
+    single self-contained file.
+    """
+    import base64
+    import mimetypes
+
+    def inline_img(src: str) -> str:
+        src = safe_img_src(src)
+        if not src:
+            return ""
+        path = os.path.normpath(os.path.join(base_dir or ".", src))
+        if not os.path.isfile(path) or \
+                not path.lower().endswith(_SAFE_IMG_EXT):
+            return ""
+        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        if not mime.startswith("image/"):
+            return ""
+        with open(path, "rb") as fh:
+            b64 = base64.b64encode(fh.read()).decode("ascii")
+        return f"data:{mime};base64,{b64}"
+
+    out, lines, i = [], md.splitlines(), 0
+    n = len(lines)
+
+    def is_table_row(s: str) -> bool:
+        return s.strip().startswith("|") and s.strip().endswith("|")
+
+    def split_row(s: str) -> list[str]:
+        return [c.strip() for c in s.strip().strip("|").split("|")]
+
+    while i < n:
+        line = lines[i]
+        s = line.strip()
+
+        if not s:
+            i += 1
+            continue
+        # fenced code
+        if s.startswith("```"):
+            i += 1
+            buf = []
+            while i < n and not lines[i].strip().startswith("```"):
+                buf.append(lines[i]); i += 1
+            i += 1
+            out.append("<pre><code>" + html.escape("\n".join(buf)) + "</code></pre>")
+            continue
+        # hr
+        if re.match(r"^(-{3,}|\*{3,}|_{3,})$", s):
+            out.append("<hr>"); i += 1; continue
+        # heading
+        m = re.match(r"^(#{1,6})\s+(.*)$", s)
+        if m:
+            lvl = len(m.group(1))
+            out.append(f"<h{lvl}>{_md_inline(m.group(2))}</h{lvl}>")
+            i += 1; continue
+        # table
+        if is_table_row(line) and i + 1 < n and \
+                re.match(r"^\|[\s:|-]+\|$", lines[i + 1].strip()):
+            head = split_row(line)
+            i += 2
+            body = []
+            while i < n and is_table_row(lines[i]):
+                body.append(split_row(lines[i])); i += 1
+            th = "".join(f"<th>{_md_inline(c)}</th>" for c in head)
+            trs = "".join(
+                "<tr>" + "".join(f"<td>{_md_inline(c)}</td>" for c in r) + "</tr>"
+                for r in body)
+            out.append(f"<table><thead><tr>{th}</tr></thead><tbody>{trs}</tbody></table>")
+            continue
+        # blockquote
+        if s.startswith(">"):
+            buf = []
+            while i < n and lines[i].strip().startswith(">"):
+                buf.append(lines[i].strip().lstrip(">").strip()); i += 1
+            out.append("<blockquote>" + _md_inline(" ".join(buf)) + "</blockquote>")
+            continue
+        # lists
+        if re.match(r"^\s*([-*+]|\d+\.)\s+", line):
+            ordered = bool(re.match(r"^\s*\d+\.\s+", line))
+            items = []
+            while i < n and re.match(r"^\s*([-*+]|\d+\.)\s+", lines[i]):
+                items.append(_md_inline(re.sub(r"^\s*([-*+]|\d+\.)\s+", "", lines[i])))
+                i += 1
+            tag = "ol" if ordered else "ul"
+            out.append(f"<{tag}>" + "".join(f"<li>{x}</li>" for x in items) + f"</{tag}>")
+            continue
+        # paragraph
+        buf = [line]
+        i += 1
+        while i < n and lines[i].strip() and not re.match(
+                r"^(#{1,6}\s|>|```|\s*([-*+]|\d+\.)\s|\|)", lines[i]):
+            buf.append(lines[i]); i += 1
+        out.append("<p>" + _md_inline(" ".join(x.strip() for x in buf)) + "</p>")
+
+    # resolve image sources in the assembled HTML (inline local files as data URIs)
+    def fix(m):
+        return (f'<img src="{inline_img(m.group(1))}"'
+                f'{m.group(2)} style="max-width:100%">')
+    return re.sub(r'<img src="([^"]+)"([^>]*)>', fix, "\n".join(out))
+
 
 # --------------------------------------------------------------------------- #
 # helpers
@@ -79,12 +286,15 @@ IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 
 
 def norm_host(v: str) -> str:
-    """Normalise a host label to a short endpoint name."""
+    """Normalise a host label to a short endpoint name.
+
+    Generic only: trim and reduce a FQDN to its first label. Endpoint display
+    names are supplied per case via the ``endpoints`` block of analysis/iocs.json
+    (see ``read_endpoints``); nothing case-specific is hardcoded here.
+    """
     v = (v or "").strip()
     v = v.split(".")[0] if re.match(r"^[A-Za-z0-9-]+\.", v) else v
-    m = {"dc2": "DC2", "sqlsvr": "SqlSvr", "dc1": "DC1", "dev01": "Attacker",
-         "attacker": "Attacker"}
-    return m.get(v.lower(), v or "Unknown")
+    return v or "Unknown"
 
 
 # --------------------------------------------------------------------------- #
@@ -105,63 +315,112 @@ def read_timeline(path: str) -> list[dict]:
 def read_iocs(path: str) -> dict:
     d = json.load(open(path, encoding="utf-8"))
     obs = d.get("observables", []) if isinstance(d, dict) else (d or [])
+    endpoints = read_endpoints(d)
+    ipmap = ip_host_map(obs, endpoints) if isinstance(d, dict) else {}
     for o in obs:
         hs = o.get("hosts")
-        if not hs:
-            hs = _infer_hosts(o)
+        if not hs and o.get("type") == "ipv4":
+            # fall back to the case endpoint inventory, if any
+            hs = [ipmap[o["value"]]] if o.get("value") in ipmap else []
         if isinstance(hs, str):
             hs = [hs]
         o["hosts"] = [norm_host(h) for h in (hs or [])]
     return {"case": d.get("case", "Incident") if isinstance(d, dict) else "Incident",
+            "endpoints": endpoints,
             "observables": obs}
 
 
-def _infer_hosts(o: dict) -> list[str]:
-    """Best-effort endpoint attribution from an observable's text."""
-    blob = " ".join(str(o.get(k, "")) for k in
-                    ("value", "source", "context", "defanged", "role")).lower()
-    hosts = []
-    if "sqlsvr" in blob:
-        hosts.append("SqlSvr")
-    if re.search(r"\bdc2\b", blob):
-        hosts.append("DC2")
-    if re.search(r"\bdc1\b", blob):
-        hosts.append("DC1")
-    if "192.168.186.135" in blob or "dev01" in blob or "attacker" in blob:
-        hosts.append("Attacker")
-    return hosts
+def read_endpoints(iocs) -> dict[str, dict]:
+    """Return the optional ``endpoints`` inventory from analysis/iocs.json.
+
+    Shape (all fields optional)::
+
+        {"endpoints": {
+            "<ip>": {"name": "FILE01", "role": "victim", "order": 2},
+            ...}}
+
+    Nothing is hardcoded: a case with no ``endpoints`` block simply yields {}.
+    """
+    if not isinstance(iocs, dict):
+        return {}
+    raw = iocs.get("endpoints")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for key, val in raw.items():
+        if isinstance(val, dict):
+            out[str(key)] = {
+                "name": str(val.get("name") or key),
+                "role": str(val.get("role") or ""),
+                "order": val.get("order") if isinstance(val.get("order"), int) else None,
+            }
+        else:  # allow {"<ip>": "HostName"}
+            out[str(key)] = {"name": str(val or key), "role": "", "order": None}
+    return out
 
 
-def ip_host_map(obs: list[dict]) -> dict[str, str]:
-    m = {}
-    known = {"192.168.186.139": "SqlSvr", "192.168.186.30": "DC2",
-             "192.168.186.10": "DC1", "192.168.186.135": "Attacker"}
-    m.update(known)
+def ip_host_map(obs: list[dict], endpoints: dict[str, dict] | None = None) -> dict[str, str]:
+    """Map IP -> endpoint display name, driven purely by analysis/iocs.json.
+
+    ``endpoints`` (the case inventory) wins; the ``hosts`` field on each
+    ipv4 observable fills any gaps. No IP or host name is hardcoded.
+    """
+    m: dict[str, str] = {}
+    for ip, meta in (endpoints or {}).items():
+        if meta.get("name"):
+            m[ip] = meta["name"]
     for o in obs:
         if o.get("type") == "ipv4" and o.get("hosts"):
             m.setdefault(str(o.get("value")), o["hosts"][0])
     return m
 
 
+def endpoint_order(endpoints: dict[str, dict]) -> list[str]:
+    """Display order of endpoints: by ``order`` field, else alphabetical."""
+    named = [m["name"] for m in endpoints.values() if m.get("name")]
+    ordered = [n for _, n in sorted(
+        ((m["order"], m["name"]) for m in endpoints.values()
+         if m.get("name") and m.get("order") is not None))]
+    rest = sorted(n for n in named if n not in ordered)
+    return ordered + rest
+
+
 # --------------------------------------------------------------------------- #
 # process trees from flattened Security.tsv (4688)
 # --------------------------------------------------------------------------- #
-INTERESTING = re.compile(
+INTERESTING_BASE = re.compile(
     r"certutil[^\r\n]*urlcache"
     r"|\bnc\.exe\b"
     r"|mimikatz"
     r"|sigmapotato"
     r"|wevtutil[^\r\n]*\bcl\b"
     r"|reg(?:\.exe)?\s+save\b"
-    r"|fypdjnvh"
     r"|psexec"
     r"|net(?:\.exe)?\s+use\b[^\r\n]*/user:"
     r"|powershell[^\r\n]*\s-(?:e|enc|encodedcommand)\b"
     r"|whoami\s+/priv"
-    r"|\bFTK Imager\.exe\b"
-    r"|Exterro_FTK"
     r"|\\temp\\[^\s\"]+\.exe",
     re.I)
+
+# Optional per-case signatures (analysis/signatures.json). Absent -> generic.
+SIGNATURES = siglib.load_signatures() if siglib else {
+    "windows_process_patterns": [], "linux_process_patterns": [],
+    "actor_keywords": {}}
+
+
+def set_signatures(path: str = "") -> None:
+    """(Re)load optional case signatures and rebind the module-level patterns."""
+    global SIGNATURES, INTERESTING, LINUX_INTERESTING
+    if siglib is None:
+        return
+    SIGNATURES = siglib.load_signatures(path)
+    INTERESTING = siglib.compile_with(INTERESTING_BASE,
+                                      SIGNATURES.get("windows_process_patterns"))
+    LINUX_INTERESTING = siglib.compile_with(LINUX_INTERESTING_BASE,
+                                            SIGNATURES.get("linux_process_patterns"))
+
+
+INTERESTING = INTERESTING_BASE
 
 
 def _parse_kv(data: str) -> dict:
@@ -220,9 +479,12 @@ def build_trees(events: list[dict]) -> dict[str, list[dict]]:
     for e in events:
         by_host[e["host"]].append(e)
 
-    # regex for the tools we always want to surface
-    HIGH = re.compile(r"certutil|nc\.exe|mimikatz|sigmapotato|wevtutil|"
-                      r"fypdjnvh|psexec|psexesvc|reg\.exe", re.I)
+    # regex for the tools we always want to surface (generic); case-specific
+    # names come from the optional signatures file
+    HIGH_BASE = re.compile(r"certutil|nc\.exe|mimikatz|sigmapotato|wevtutil|"
+                           r"psexec|psexesvc|reg\.exe", re.I)
+    HIGH = siglib.compile_with(HIGH_BASE, SIGNATURES.get("windows_process_patterns")) \
+        if siglib else HIGH_BASE
 
     trees: dict[str, list[dict]] = {}
     for host, evs in by_host.items():
@@ -342,15 +604,18 @@ def build_trees(events: list[dict]) -> dict[str, list[dict]]:
 # --------------------------------------------------------------------------- #
 # process tree from a Linux `linux_proctree.py` snapshot (--proc-linux)
 # --------------------------------------------------------------------------- #
-LINUX_INTERESTING = re.compile(
+LINUX_INTERESTING_BASE = re.compile(
     r"\bcron\b|/dev/shm|/tmp/|\.upd\b|curl|wget|base64|bash -c|nc\b|ncat|"
-    r"socat|chisel|python3? -c|systemd-journald-helper|updat3|realm|"
+    r"socat|chisel|python3? -c|systemd-journald-helper|"
     r"sudo|/bin/su\b|\bsu\b|sshd|tmux|xterm|wsgi|uwsgi|mysql|sqlite|"
     r"velociraptor|ssh-agent",
     re.I)
 
+LINUX_INTERESTING = LINUX_INTERESTING_BASE
+
 
 def _linux_interesting(s: str) -> bool:
+    # linux_proctree.is_interesting also honours the optional signatures file
     if lpt is not None:
         return lpt.is_interesting(s)
     return bool(LINUX_INTERESTING.search(s or ""))
@@ -538,7 +803,9 @@ section.panel.active{display:block}
 #container{width:100%;height:60vh;min-height:420px}
 .hint{color:var(--mut);font-size:12px;margin:0 0 10px}
 table{border-collapse:collapse;width:100%;font-size:12px}
-th,td{border:1px solid var(--line);padding:6px 8px;vertical-align:top;text-align:left}
+.tablewrap{width:100%;overflow-x:auto}
+th,td{border:1px solid var(--line);padding:6px 8px;vertical-align:top;text-align:left;
+  overflow-wrap:anywhere;word-break:break-word}
 th{background:#0d1117;position:sticky;top:0;cursor:pointer;user-select:none}
 tr:hover td{background:#1a2029}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
@@ -572,6 +839,19 @@ ul.tree>li{margin:2px 0}
 .legend{display:flex;gap:14px;flex-wrap:wrap;color:var(--mut);font-size:12px;margin:8px 0}
 .legend span.sw{display:inline-block;width:11px;height:11px;border-radius:2px;margin-right:4px}
 .empty{color:var(--mut);padding:16px;font-style:italic}
+.report-md{max-width:980px;line-height:1.6}
+.report-md h1{font-size:22px;border-bottom:1px solid var(--line);padding-bottom:6px}
+.report-md h2{font-size:18px;margin-top:22px;border-bottom:1px solid var(--line);padding-bottom:4px}
+.report-md h3{font-size:15px;margin-top:16px}
+.report-md table{margin:10px 0}
+.report-md blockquote{border-left:3px solid var(--acc);margin:10px 0;padding:2px 12px;
+  color:var(--mut);background:#0d1117}
+.report-md code{background:#0d1117;border:1px solid var(--line);border-radius:4px;
+  padding:1px 5px;font-family:ui-monospace,monospace;font-size:12px}
+.report-md pre{background:#0d1117;border:1px solid var(--line);border-radius:6px;
+  padding:10px;overflow:auto}
+.report-md img{border:1px solid var(--line);border-radius:6px;margin:8px 0}
+.report-md a{color:var(--acc)}
 footer{color:#6e7681;font-size:11px;padding:0 24px 30px}
 a{color:var(--acc)}
 </style>
@@ -590,6 +870,7 @@ a{color:var(--acc)}
 <div class="stats" id="stats"></div>
 
 <nav class="tabs" id="tabs">
+  <button data-tab="report">Report</button>
   <button data-tab="overview" class="active">Overview</button>
   <button data-tab="timeline">Timeline</button>
   <button data-tab="graph">Actor graph</button>
@@ -600,6 +881,11 @@ a{color:var(--acc)}
 </nav>
 
 <main>
+  <section class="panel" id="p-report">
+    <p class="hint">Full narrative incident report (embedded). Content is
+      endpoint-agnostic; use the visual tabs above to scope by endpoint.</p>
+    <div class="report-md" id="reportMd"></div>
+  </section>
   <section class="panel active" id="p-overview">
     <p class="hint">Per-endpoint summary of the attack chain. Select an endpoint
       above to scope every tab (the default “All endpoints” is the global view).</p>
@@ -700,15 +986,15 @@ function renderTimeline(){
   const items=[], groups=[], seen=new Set();
   rows.forEach((r,i)=>{
     const host=r.host;
-    if(!seen.has(host)){ seen.add(host); groups.push({id:host, content:host}); }
+    if(!seen.has(host)){ seen.add(host); groups.push({id:host, content:esc(host)}); }
     const tags=(r.tags||'').split(';').filter(Boolean);
     const ptag=tags[0]||'default';
     items.push({id:i, group:host, start:r.time_utc||null,
-      content:(r.event||'').slice(0,70),
+      content:esc((r.event||'').slice(0,70)),
       className:'tl-'+(TAG_COLORS[ptag]?'x':'default'),
       style:'background:'+(TAG_COLORS[ptag]||'#3498db')+';border-color:'+(TAG_COLORS[ptag]||'#3498db')+';color:#fff',
-      title:[r.time_utc,'host: '+host,'actor: '+r.actor,'technique: '+r.technique,
-             'tags: '+r.tags,'evidence: '+r.evidence].filter(x=>x.split(': ')[1]).join('\n')});
+      title:esc([r.time_utc,'host: '+host,'actor: '+r.actor,'technique: '+r.technique,
+             'tags: '+r.tags,'evidence: '+r.evidence].filter(x=>x.split(': ')[1]).join('\n'))});
   });
   if(timelineObj){ try{timelineObj.destroy();}catch(e){} timelineObj=null; }
   el.innerHTML='';
@@ -732,8 +1018,9 @@ function renderGraph(){
   if(!(window.vis && vis.Network)){ el.innerHTML='<div class="empty">Graph library unavailable.</div>'; return; }
   const types=[...new Set(nodes.map(n=>n.type))];
   document.getElementById('graphLegend').innerHTML = types.map(t =>
-    `<span><span class="sw" style="background:${(DATA.type_colors[t]||'#3498db')}"></span>${t}</span>`).join('');
-  netObj = new vis.Network(el, {nodes:new vis.DataSet(nodes), edges:new vis.DataSet(edges)},
+    `<span><span class="sw" style="background:${(DATA.type_colors[t]||'#3498db')}"></span>${esc(t)}</span>`).join('');
+  const safeNodes = nodes.map(n => Object.assign({}, n, {label:esc(n.label||''), title:esc(n.title||'')}));
+  netObj = new vis.Network(el, {nodes:new vis.DataSet(safeNodes), edges:new vis.DataSet(edges)},
     {physics:{stabilization:true},
      nodes:{shape:'dot', font:{size:14,color:'#e6edf3'}},
      edges:{arrows:'to', font:{size:10,color:'#8b949e',align:'middle'},
@@ -786,8 +1073,8 @@ function renderTable(elId, list){
     if(!x) return 1; if(!y) return -1;
     return x.localeCompare(y);
   });
-  el.innerHTML=`<table><thead><tr>${OBS_HEAD.map(h=>`<th>${h}</th>`).join('')}</tr></thead>
-    <tbody>${rows.map(obsRow).join('')}</tbody></table>`;
+  el.innerHTML=`<div class="tablewrap"><table><thead><tr>${OBS_HEAD.map(h=>`<th>${h}</th>`).join('')}</tr></thead>
+    <tbody>${rows.map(obsRow).join('')}</tbody></table></div>`;
 }
 function renderObservables(){ renderTable('obsTable', filtObs(DATA.observables)); }
 function renderIocs(){ renderTable('iocTable', filtObs(DATA.observables).filter(o=>!isBenign(o))); }
@@ -809,7 +1096,7 @@ function renderMatrix(){
   const el=document.getElementById('matrix');
   if(!cols.length){ el.innerHTML='<div class="empty">No ATT&CK techniques for this filter.</div>'; return; }
   el.innerHTML=cols.map(t=>`<div class="tac"><h4>${t}</h4>${grid[t].sort((a,b)=>b.n-a.n)
-    .map(d=>`<span class="tech ${d.n>=3?'hi':(d.n===2?'md':'lo')}" title="${esc([...new Set(d.vals)].slice(0,8).join('; '))}">${d.id} ×${d.n}</span>`).join('')}</div>`).join('');
+    .map(d=>`<span class="tech ${d.n>=3?'hi':(d.n===2?'md':'lo')}" title="${esc([...new Set(d.vals)].slice(0,8).join('; '))}">${esc(d.id)} ×${d.n}</span>`).join('')}</div>`).join('');
 }
 
 /* ---- overview ---- */
@@ -823,22 +1110,30 @@ function renderOverview(){
     const first=tl[0]?tl[0].time_utc:'—', last=tl.length?tl[tl.length-1].time_utc:'—';
     const tech=[...new Set(tl.flatMap(r=>(r.technique||'').split(/[,\s]+/)).filter(Boolean))];
     parts.push(`<div class="stat" style="min-width:auto">
-      <div style="font-weight:700;font-size:15px;margin-bottom:6px">${host}</div>
-      <div style="font-size:12px;color:var(--mut)">Window: ${first} → ${last}</div>
+      <div style="font-weight:700;font-size:15px;margin-bottom:6px">${esc(host)}</div>
+      <div style="font-size:12px;color:var(--mut)">Window: ${esc(first)} → ${esc(last)}</div>
       <div style="margin-top:6px">events <b>${tl.length}</b> · observables <b>${obs.length}</b>
         · attacker IOCs <b>${atk.length}</b> · techniques <b>${tech.length}</b></div>
-      <div style="margin-top:8px">${tech.map(t=>`<span class="tech lo" style="display:inline-block">${t}</span>`).join('')}</div>
+      <div style="margin-top:8px">${tech.map(t=>`<span class="tech lo" style="display:inline-block">${esc(t)}</span>`).join('')}</div>
     </div>`);
   }
   document.getElementById('overviewCards').innerHTML =
     `<div class="stats" style="padding:0">${parts.join('')}</div>`;
 }
 
+/* ---- report (embedded markdown, static) ---- */
+function renderReport(){
+  const el=document.getElementById('reportMd');
+  if(!el) return;
+  el.innerHTML = (DATA.report_html && DATA.report_html.length)
+    ? DATA.report_html : '<div class="empty">No report embedded.</div>';
+}
+
 function esc(s){ return (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
 function safe(fn){ try{ fn(); }catch(e){ console.error('[dashboard]', e); } }
 function renderAll(){
-  [renderStats, renderOverview, renderTimeline, renderGraph,
+  [renderReport, renderStats, renderOverview, renderTimeline, renderGraph,
    renderTrees, renderObservables, renderIocs, renderMatrix].forEach(safe);
 }
 
@@ -862,6 +1157,18 @@ renderAll();
 """
 
 
+def _apply_template(template: str, subs: dict) -> str:
+    """Substitute placeholders, applying $data / $report last to avoid a
+    substituted value being re-scanned for later placeholders."""
+    deferred = {k: subs[k] for k in ("$data", "$embeds") if k in subs}
+    for k, v in subs.items():
+        if k not in deferred:
+            template = template.replace(k, v)
+    for k, v in deferred.items():
+        template = template.replace(k, v)
+    return template
+
+
 def render_html(title: str, subtitle: str, data: dict, treehint: str = "") -> str:
     visnet = _load_asset("vis-network.min.js")
     vistimeline = _load_asset("vis-timeline-graph2d.min.js")
@@ -875,15 +1182,436 @@ def render_html(title: str, subtitle: str, data: dict, treehint: str = "") -> st
         "$viscss": css,
         "$visnet": visnet,
         "$vistimeline": vistimeline,
-        "$data": json.dumps(data, ensure_ascii=False),
-        "$tactics": json.dumps(TACTIC_ORDER),
-        "$tech_tactics": json.dumps(TECHNIQUE_TACTICS),
-        "$tag_colors": json.dumps(TAG_COLORS),
+        "$data": json_for_script(data),
+        "$tactics": json_for_script(TACTIC_ORDER),
+        "$tech_tactics": json_for_script(TECHNIQUE_TACTICS),
+        "$tag_colors": json_for_script(TAG_COLORS),
     }
-    out = HTML
-    for k, v in subs.items():
-        out = out.replace(k, v)
-    return out
+    return _apply_template(HTML, subs)
+
+
+# --------------------------------------------------------------------------- #
+# document (single-scroll) layout: report + all panels, per-section filters
+# --------------------------------------------------------------------------- #
+HTML_DOC = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>$title</title>
+<style>
+:root{color-scheme:dark;--bg:#0b0d12;--panel:#12141a;--panel2:#171a22;--line:#232838;
+  --fg:#e6e8ee;--mut:#8b90a0;--acc:#6d6afc;--acc2:#8f8cff;
+  --ok:#2ea043;--warn:#d29922;--crit:#e5484d;}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font:14px/1.6 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+a{color:var(--acc2);text-decoration:none}a:hover{text-decoration:underline}
+header.top{padding:18px 28px;border-bottom:1px solid var(--line);background:var(--panel);
+  position:sticky;top:0;z-index:60}
+header.top h1{margin:0;font-size:20px;letter-spacing:.2px}
+header.top .sub{color:var(--mut);font-size:12px;margin-top:3px}
+.layout{display:grid;grid-template-columns:250px minmax(0,1fr);gap:0;max-width:1600px;
+  margin:0 auto}
+nav.toc{position:sticky;top:69px;align-self:start;height:calc(100vh - 69px);
+  overflow:auto;padding:18px 14px;border-right:1px solid var(--line)}
+nav.toc .lbl{color:var(--acc2);font-size:11px;text-transform:uppercase;letter-spacing:1px;
+  margin:4px 8px 8px}
+nav.toc a{display:block;color:var(--mut);padding:6px 10px;border-radius:8px;font-size:13px;
+  border:1px solid transparent}
+nav.toc a:hover{color:var(--fg);background:var(--panel2)}
+nav.toc a.active{color:var(--fg);background:#1b1e2b;border-color:var(--line);
+  box-shadow:inset 2px 0 0 var(--acc)}
+main{padding:26px 34px 80px;min-width:0}
+section.blk{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+  padding:20px 22px;margin:0 0 22px;overflow:hidden}
+section.blk>h2.blk-title{font-size:16px;margin:0 0 4px;display:flex;align-items:center;gap:10px}
+section.blk>h2.blk-title .accent{color:var(--acc2);font-size:11px;text-transform:uppercase;
+  letter-spacing:1.5px;display:block;margin-bottom:2px}
+section.blk>p.blk-sub{color:var(--mut);font-size:12px;margin:0 0 14px}
+.filters{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 14px}
+.filters .flabel{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.8px}
+.chips{display:flex;gap:6px;flex-wrap:wrap}
+.chip{background:var(--panel2);border:1px solid var(--line);color:var(--fg);
+  border-radius:999px;padding:4px 12px;cursor:pointer;font-size:12px}
+.chip.active{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
+.chip.benign.active{background:#4a5060;border-color:#4a5060}
+.search{background:var(--bg);border:1px solid var(--line);color:var(--fg);
+  border-radius:8px;padding:6px 10px;font-size:12px;min-width:200px}
+.switch{display:flex;align-items:center;gap:6px;color:var(--mut);font-size:12px;cursor:pointer}
+.applyall{margin-left:auto;font-size:11px;color:var(--mut);display:flex;align-items:center;gap:6px}
+#tl, #gc{width:100%;height:56vh;min-height:360px}
+.legend{display:flex;gap:14px;flex-wrap:wrap;color:var(--mut);font-size:12px;margin:6px 0}
+.legend span.sw{display:inline-block;width:11px;height:11px;border-radius:2px;margin-right:4px}
+table{border-collapse:collapse;width:100%;font-size:12px}
+.tablewrap{width:100%;overflow-x:auto}
+th,td{border:1px solid var(--line);padding:6px 8px;vertical-align:top;text-align:left;
+  overflow-wrap:anywhere;word-break:break-word}
+th{background:var(--panel2);color:var(--mut);text-transform:uppercase;font-size:10px;
+  letter-spacing:.6px}
+tr:hover td{background:#1a1e29}
+.mono,code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px}
+.tag{display:inline-block;padding:1px 7px;border-radius:6px;font-size:10px;
+  background:#1b1e2b;margin:1px 3px 1px 0;border:1px solid var(--line);color:#c9cede}
+.badge{display:inline-block;padding:1px 7px;border-radius:6px;font-size:10px;font-weight:600}
+.b-high{background:#3a1214;color:#ff9a9e;border:1px solid #6e2226}
+.b-medium{background:#33260c;color:#f2cc60;border:1px solid #6b5220}
+.b-low{background:#12233a;color:#9cc7ff;border:1px solid #27456e}
+.b-benign{background:#232838;color:#aab0c0}
+.matrix{display:flex;gap:10px;overflow-x:auto;padding-bottom:8px}
+.tac{min-width:150px;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:10px}
+.tac h4{margin:0 0 8px;font-size:10px;color:var(--mut);text-transform:uppercase;letter-spacing:1px}
+.tech{display:block;background:#2a2160;color:#cfcaff;border:1px solid #4b41b0;
+  border-radius:6px;padding:3px 7px;margin:4px 0;font-size:11px}
+.tech.hi{background:#5a1620;border-color:#8e2430;color:#ffd0d4}
+.tech.md{background:#2a2160;border-color:#4b41b0}
+.tech.lo{background:#1a2333;border-color:#2c3a52;color:#b9c6dd}
+.tree-host{margin:0 0 20px}
+.tree-host h3{margin:6px 0;font-size:14px}
+ul.tree,ul.tree ul{list-style:none;margin:0;padding-left:16px}
+.proc{border-left:3px solid var(--line);padding:3px 10px;margin:3px 0;border-radius:0 6px 6px 0;
+  background:var(--panel2)}
+.proc.hit{border-left-color:var(--crit)}
+.proc .nm{font-weight:600;font-family:ui-monospace,monospace}
+.proc .cmd{color:var(--mut);font-size:11px;word-break:break-all}
+.proc .meta{color:#6e7681;font-size:10px}
+.empty{color:var(--mut);padding:14px;font-style:italic}
+.stats{display:flex;gap:10px;flex-wrap:wrap}
+.stat{background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:8px 14px;
+  min-width:110px}
+.stat .n{font-size:20px;font-weight:700}.stat .l{color:var(--mut);font-size:10px;
+  text-transform:uppercase;letter-spacing:.6px}
+iframe.embed{width:100%;height:70vh;border:1px solid var(--line);border-radius:10px;background:#0d1117}
+/* report markdown */
+.report-md{max-width:none}
+.report-md table{width:100%;table-layout:fixed;overflow-wrap:anywhere;word-break:break-word}
+.report-md h1{font-size:22px;border-bottom:1px solid var(--line);padding-bottom:6px}
+.report-md h2{font-size:18px;margin-top:22px;border-bottom:1px solid var(--line);padding-bottom:4px}
+.report-md h3{font-size:15px;margin-top:16px}
+.report-md blockquote{border-left:3px solid var(--acc);margin:10px 0;padding:2px 12px;
+  color:var(--mut);background:var(--bg)}
+.report-md code{background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:1px 5px}
+.report-md img{border:1px solid var(--line);border-radius:8px;margin:8px 0}
+footer{color:#6e7681;font-size:11px;padding:0 34px 40px;max-width:1600px;margin:0 auto}
+@media (max-width:900px){
+  .layout{grid-template-columns:1fr}
+  nav.toc{position:sticky;top:69px;height:auto;max-height:38vh;border-right:none;
+    border-bottom:1px solid var(--line);background:var(--bg);z-index:50}
+  th{top:auto}
+}
+</style>
+</head><body>
+<header class="top">
+  <h1>$title</h1>
+  <div class="sub">$subtitle</div>
+</header>
+<div class="layout">
+  <nav class="toc" id="toc"><div class="lbl">On this page</div></nav>
+  <main>
+    <section class="blk" id="sec-report">
+      <h2 class="blk-title"><span><span class="accent">Report</span>Incident narrative</span></h2>
+      <p class="blk-sub">Full write-up. The data sections below each carry their own filter.</p>
+      <div class="report-md" id="reportMd"></div>
+    </section>
+
+    <section class="blk" id="sec-overview">
+      <h2 class="blk-title"><span><span class="accent">Summary</span>Per-endpoint overview</span></h2>
+      <div class="stats" id="overviewCards"></div>
+    </section>
+
+    <section class="blk" id="sec-timeline" data-sect="timeline">
+      <h2 class="blk-title"><span><span class="accent">Chronology</span>Attack timeline (UTC)</span></h2>
+      <p class="blk-sub">Hover an item for its source record. Filtered to the endpoints selected below.</p>
+      <div class="filters" data-role="filters">
+        <span class="flabel">Endpoints</span><div class="chips" data-chips></div>
+        <input class="search" data-q placeholder="search…">
+      </div>
+      <div id="tl"></div>
+    </section>
+
+    <section class="blk" id="sec-graph" data-sect="graph">
+      <h2 class="blk-title"><span><span class="accent">Relations</span>Actor graph</span></h2>
+      <p class="blk-sub">Attacker / victim / observable relationships. Drag nodes; hover for source.</p>
+      <div class="filters" data-role="filters">
+        <span class="flabel">Endpoints</span><div class="chips" data-chips></div>
+      </div>
+      <div class="legend" id="graphLegend"></div>
+      <div id="gc"></div>
+    </section>
+
+    <section class="blk" id="sec-trees" data-sect="trees">
+      <h2 class="blk-title"><span><span class="accent">Execution</span>Process trees</span></h2>
+      <p class="blk-sub">$treehint</p>
+      <div class="filters" data-role="filters">
+        <span class="flabel">Endpoints</span><div class="chips" data-chips></div>
+      </div>
+      <div id="trees"></div>
+    </section>
+
+    <section class="blk" id="sec-observables" data-sect="observables">
+      <h2 class="blk-title"><span><span class="accent">Observables</span>All indicators</span></h2>
+      <p class="blk-sub">Includes benign/responder. Oldest first.</p>
+      <div class="filters" data-role="filters">
+        <span class="flabel">Endpoints</span><div class="chips" data-chips></div>
+        <input class="search" data-q placeholder="search…">
+        <label class="switch"><input type="checkbox" data-benign> hide benign / responder</label>
+      </div>
+      <div id="obsTable"></div>
+    </section>
+
+    <section class="blk" id="sec-iocs" data-sect="iocs">
+      <h2 class="blk-title"><span><span class="accent">Threat intel</span>IOCs (non-benign)</span></h2>
+      <p class="blk-sub">Benign/responder observables removed.</p>
+      <div class="filters" data-role="filters">
+        <span class="flabel">Endpoints</span><div class="chips" data-chips></div>
+        <input class="search" data-q placeholder="search…">
+      </div>
+      <div id="iocTable"></div>
+    </section>
+
+    <section class="blk" id="sec-matrix" data-sect="matrix">
+      <h2 class="blk-title"><span><span class="accent">MITRE</span>ATT&amp;CK coverage</span></h2>
+      <p class="blk-sub">Techniques from observables in scope for this section.</p>
+      <div class="filters" data-role="filters">
+        <span class="flabel">Endpoints</span><div class="chips" data-chips></div>
+      </div>
+      <div class="matrix" id="matrix"></div>
+    </section>
+
+    $embeds
+  </main>
+</div>
+<footer>Generated $generated by incident_dashboard.py (document layout) — offline, self-contained.</footer>
+<style>$viscss</style>
+<script>$visnet</script>
+<script>$vistimeline</script>
+<script>
+const DATA = $data;
+const TACTICS = $tactics;
+const TECH_TACTICS = $tech_tactics;
+const TAG_COLORS = $tag_colors;
+const ALL = "__ALL__";
+
+/* ---- per-section state ---- */
+const SECTIONS = ['timeline','graph','trees','observables','iocs','matrix'];
+const S = {};
+SECTIONS.forEach(id => S[id] = {host: ALL, q: "", hideBenign: false});
+function secEl(id){ return document.getElementById('sec-'+id); }
+function inHost(sec, hosts){ return sec.host===ALL || (hosts||[]).includes(sec.host); }
+function textMatch(sec, blob){ return !sec.q || (blob||"").toLowerCase().includes(sec.q.toLowerCase()); }
+function isBenign(o){
+  const t=(o.tags||[]).join(" ").toLowerCase()+" "+(o.confidence||"");
+  return /benign|responder|internal/.test(t);
+}
+function filtObs(sec, list){
+  return list.filter(o => inHost(sec,o.hosts) && textMatch(sec,JSON.stringify(o)) &&
+    (!sec.hideBenign || !isBenign(o)));
+}
+function esc(s){ return (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+/* ---- build per-section filter bars ---- */
+function hostSet(){
+  const s=new Set();
+  DATA.timeline.forEach(r=>r.host&&s.add(r.host));
+  [].concat(...DATA.observables.map(o=>o.hosts||[]),[].concat(...DATA.graph.nodes.map(n=>n.hosts||[]))).forEach(h=>h&&s.add(h));
+  return [...s];
+}
+const HOSTS = DATA.hosts.length ? DATA.hosts : hostSet();
+function buildFilters(){
+  document.querySelectorAll('.blk[data-sect]').forEach(blk=>{
+    const id=blk.dataset.sect, bar=blk.querySelector('[data-role=filters]');
+    if(!bar) return;
+    const chipbox=bar.querySelector('[data-chips]');
+    if(chipbox){
+      chipbox.innerHTML=[ALL].concat(HOSTS).map(h=>
+        `<div class="chip ${S[id].host===h?'active':''}" data-h="${h}">${h===ALL?'All':h}</div>`).join('');
+      chipbox.querySelectorAll('.chip').forEach(c=>c.onclick=()=>{
+        S[id].host=c.dataset.h;
+        chipbox.querySelectorAll('.chip').forEach(x=>x.classList.toggle('active',x===c));
+        renderSection(id);
+      });
+    }
+    const q=bar.querySelector('[data-q]');
+    if(q) q.oninput=e=>{ S[id].q=e.target.value; renderSection(id); };
+    const b=bar.querySelector('[data-benign]');
+    if(b) b.onchange=e=>{ S[id].hideBenign=e.target.checked; renderSection(id); };
+  });
+}
+
+/* ---- renderers ---- */
+const VIS={};
+function renderSection(id){
+  const sec=S[id];
+  try{
+    if(id==='timeline') renderTimeline(sec);
+    else if(id==='graph') renderGraph(sec);
+    else if(id==='trees') renderTrees(sec);
+    else if(id==='observables') renderTable('obsTable', filtObs(sec,DATA.observables));
+    else if(id==='iocs') renderTable('iocTable', filtObs(sec,DATA.observables).filter(o=>!isBenign(o)));
+    else if(id==='matrix') renderMatrix(sec);
+  }catch(e){ console.error('[document]',id,e); }
+}
+function renderTimeline(sec){
+  const rows=DATA.timeline.filter(r=>inHost(sec,[r.host]) && textMatch(sec,JSON.stringify(r)));
+  const el=document.getElementById('tl');
+  const items=[],groups=[],seen=new Set();
+  rows.forEach((r,i)=>{
+    const host=r.host;
+    if(!seen.has(host)){seen.add(host);groups.push({id:host,content:esc(host)});}
+    const tags=(r.tags||'').split(';').filter(Boolean), ptag=tags[0]||'default';
+    items.push({id:i,group:host,start:r.time_utc||null,
+      content:esc((r.event||'').slice(0,70)),
+      style:'background:'+(TAG_COLORS[ptag]||'#3498db')+';border-color:'+(TAG_COLORS[ptag]||'#3498db')+';color:#fff',
+      title:esc([r.time_utc,'host: '+host,'actor: '+r.actor,'technique: '+r.technique,
+             'tags: '+r.tags,'evidence: '+r.evidence].filter(x=>x.split(': ')[1]).join('\n'))});
+  });
+  if(VIS.timeline){try{VIS.timeline.destroy();}catch(e){} VIS.timeline=null;}
+  el.innerHTML='';
+  if(!items.length){el.innerHTML='<div class="empty">No timeline rows for this filter.</div>';return;}
+  if(!(window.vis&&vis.Timeline)){el.innerHTML='<div class="empty">Timeline library unavailable.</div>';return;}
+  VIS.timeline=new vis.Timeline(el,new vis.DataSet(items),new vis.DataSet(groups),
+    {stack:true,zoomable:true,moveable:true,selectable:true,horizontalScroll:true,
+     minHeight:'100%',margin:{item:{horizontal:4}}});
+}
+function renderGraph(sec){
+  const nodes=DATA.graph.nodes.filter(n=>inHost(sec,n.hosts));
+  const ids=new Set(nodes.map(n=>n.id));
+  const edges=DATA.graph.edges.filter(e=>ids.has(e.from)&&ids.has(e.to));
+  const el=document.getElementById('gc');
+  if(VIS.graph){try{VIS.graph.destroy();}catch(e){} VIS.graph=null;}
+  el.innerHTML='';
+  if(!nodes.length){el.innerHTML='<div class="empty">No graph nodes for this filter.</div>';return;}
+  if(!(window.vis&&vis.Network)){el.innerHTML='<div class="empty">Graph library unavailable.</div>';return;}
+  const types=[...new Set(nodes.map(n=>n.type))];
+  document.getElementById('graphLegend').innerHTML=types.map(t=>
+    `<span><span class="sw" style="background:${(DATA.type_colors[t]||'#3498db')}"></span>${esc(t)}</span>`).join('');
+  const safeNodes=nodes.map(n=>Object.assign({},n,{label:esc(n.label||''),title:esc(n.title||'')}));
+  VIS.graph=new vis.Network(el,{nodes:new vis.DataSet(safeNodes),edges:new vis.DataSet(edges)},
+    {physics:{stabilization:true},nodes:{shape:'dot',font:{size:14,color:'#e6e8ee'}},
+     edges:{arrows:'to',font:{size:10,color:'#8b90a0',align:'middle'},
+            color:{color:'#3d4b5c',highlight:'#6d6afc'}},interaction:{hover:true,tooltipDelay:120}});
+}
+function procNode(n){
+  const kids=n.children.map(procNode).join('');
+  return `<li><div class="proc ${n.interesting?'hit':''}">
+    <div class="nm">${esc(n.name)} <span class="meta">pid ${n.pid} · ${esc(n.user||'')} · ${esc(n.ts)}${n.repeat>1?' · ×'+n.repeat+' identical':''}</span></div>
+    ${n.cmd?`<div class="cmd">${esc(n.cmd)}</div>`:''}${kids?`<ul>${kids}</ul>`:''}</div></li>`;
+}
+function countNodes(roots){let n=0;const w=r=>{n++;r.children.forEach(w);};roots.forEach(w);return n;}
+function renderTrees(sec){
+  const box=document.getElementById('trees');const parts=[];
+  for(const host of HOSTS){
+    if(sec.host!==ALL && sec.host!==host) continue;
+    const roots=(DATA.trees[host]||[]);
+    if(!roots.length) continue;
+    parts.push(`<div class="tree-host"><h3>${host} <span class="meta">${countNodes(roots)} processes kept</span></h3>
+      <ul class="tree">${roots.map(procNode).join('')}</ul></div>`);
+  }
+  box.innerHTML=parts.length?parts.join(''):'<div class="empty">No process data for this filter.</div>';
+}
+function obsRow(o){
+  const val=o.defanged?`<span class="mono">${esc(o.defanged)}</span>`:`<span class="mono">${esc(o.value)}</span>`;
+  const hs=(o.hosts||[]).map(h=>`<span class="tag">${esc(h)}</span>`).join('');
+  const tags=(o.tags||[]).map(t=>`<span class="tag">${esc(t)}</span>`).join('');
+  const conf=o.confidence?`<span class="badge b-${o.confidence}">${o.confidence}</span>`:'';
+  return `<tr><td class="mono">${esc(o.first_seen_utc||'')}</td>
+    <td>${esc(o.type)}</td><td>${val}</td><td>${esc(o.role||'')}</td>
+    <td>${hs}</td><td>${conf}</td><td>${esc(o.mitre||'')}</td><td>${tags}</td>
+    <td>${esc(o.context||'')}</td><td>${esc(o.source||'')}</td></tr>`;
+}
+const OBS_HEAD=['first seen (UTC)','type','value (defanged)','role','endpoints','confidence','mitre','tags','context','source'];
+function renderTable(elId,list){
+  const el=document.getElementById(elId);
+  if(!list.length){el.innerHTML='<div class="empty">No rows for this filter.</div>';return;}
+  const rows=[...list].sort((a,b)=>{const x=a.first_seen_utc||'',y=b.first_seen_utc||'';
+    if(!x)return 1;if(!y)return -1;return x.localeCompare(y);});
+  el.innerHTML=`<div class="tablewrap"><table><thead><tr>${OBS_HEAD.map(h=>`<th>${h}</th>`).join('')}</tr></thead>
+    <tbody>${rows.map(obsRow).join('')}</tbody></table></div>`;
+}
+function renderMatrix(sec){
+  const obs=filtObs(sec,DATA.observables);
+  const tech={};
+  obs.forEach(o=>{(o.mitre||"").split(/[,\s]+/).filter(t=>/^T\d{4}/.test(t)).forEach(t=>{
+    tech[t]=tech[t]||{n:0,vals:[]};tech[t].n++;if(o.value)tech[t].vals.push(o.value);});});
+  const grid={};TACTICS.forEach(t=>grid[t]=[]);
+  for(const t in tech){const base=t.split('.')[0];
+    grid[TECH_TACTICS[t]||TECH_TACTICS[base]||'Other'].push({id:t,n:tech[t].n,vals:tech[t].vals});}
+  const cols=TACTICS.filter(t=>grid[t].length);
+  const el=document.getElementById('matrix');
+  if(!cols.length){el.innerHTML='<div class="empty">No ATT&CK techniques for this filter.</div>';return;}
+  el.innerHTML=cols.map(t=>`<div class="tac"><h4>${t}</h4>${grid[t].sort((a,b)=>b.n-a.n)
+    .map(d=>`<span class="tech ${d.n>=3?'hi':(d.n===2?'md':'lo')}" title="${esc([...new Set(d.vals)].slice(0,8).join('; '))}">${esc(d.id)} ×${d.n}</span>`).join('')}</div>`).join('');
+}
+function renderReport(){
+  const el=document.getElementById('reportMd'); if(!el) return;
+  el.innerHTML=(DATA.report_html&&DATA.report_html.length)?DATA.report_html:'<div class="empty">No report embedded.</div>';
+}
+function renderOverview(){
+  const parts=[];
+  for(const host of HOSTS){
+    const tl=DATA.timeline.filter(r=>r.host===host);
+    const obs=DATA.observables.filter(o=>(o.hosts||[]).includes(host));
+    const atk=obs.filter(o=>!isBenign(o));
+    const first=tl[0]?tl[0].time_utc:'—', last=tl.length?tl[tl.length-1].time_utc:'—';
+    const tech=[...new Set(tl.flatMap(r=>(r.technique||'').split(/[,\s]+/)).filter(Boolean))];
+    parts.push(`<div class="stat" style="min-width:220px">
+      <div style="font-weight:700;font-size:15px;margin-bottom:6px">${esc(host)}</div>
+      <div style="font-size:12px;color:var(--mut)">Window: ${esc(first)} → ${esc(last)}</div>
+      <div style="margin-top:6px">events <b>${tl.length}</b> · observables <b>${obs.length}</b>
+        · attacker IOCs <b>${atk.length}</b> · techniques <b>${tech.length}</b></div>
+      <div style="margin-top:8px">${tech.map(t=>`<span class="tech lo" style="display:inline-block">${esc(t)}</span>`).join('')}</div>
+    </div>`);
+  }
+  document.getElementById('overviewCards').innerHTML=`<div class="stats">${parts.join('')}</div>`;
+}
+
+/* ---- TOC + scroll-spy ---- */
+function buildToc(){
+  const toc=document.getElementById('toc');
+  document.querySelectorAll('main section.blk').forEach(sec=>{
+    const h=sec.querySelector('h2.blk-title'); if(!h) return;
+    const clone=h.cloneNode(true);
+    const acc=clone.querySelector('.accent'); if(acc) acc.remove();
+    const label=(clone.textContent||'').replace(/\s+/g,' ').trim();
+    toc.insertAdjacentHTML('beforeend',`<a href="#${sec.id}" data-t="${sec.id}">${label}</a>`);
+  });
+  const links={}; toc.querySelectorAll('a').forEach(a=>links[a.dataset.t]=a);
+  const obs=new IntersectionObserver(es=>{
+    es.forEach(e=>{ if(e.isIntersecting){
+      Object.values(links).forEach(a=>a.classList.remove('active'));
+      if(links[e.target.id]) links[e.target.id].classList.add('active');
+    }});
+  },{rootMargin:'-70px 0px -70% 0px',threshold:0});
+  document.querySelectorAll('main section.blk').forEach(s=>obs.observe(s));
+}
+
+buildFilters();
+buildToc();
+['timeline','graph','trees','observables','iocs','matrix'].forEach(renderSection);
+renderReport(); renderOverview();
+</script>
+</body></html>
+"""
+
+
+def render_document(title: str, subtitle: str, data: dict, treehint: str = "",
+                    embeds: str = "") -> str:
+    visnet = _load_asset("vis-network.min.js")
+    vistimeline = _load_asset("vis-timeline-graph2d.min.js")
+    css = _load_asset("vis-timeline-graph2d.min.css")
+    subs = {
+        "$title": html.escape(title),
+        "$subtitle": html.escape(subtitle),
+        "$treehint": html.escape(treehint or
+            "Attacker-relevant processes + lineage. Endpoint-filtered."),
+        "$generated": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "$viscss": css, "$visnet": visnet, "$vistimeline": vistimeline,
+        "$data": json_for_script(data),
+        "$tactics": json_for_script(TACTIC_ORDER),
+        "$tech_tactics": json_for_script(TECHNIQUE_TACTICS),
+        "$tag_colors": json_for_script(TAG_COLORS),
+        "$embeds": embeds,
+    }
+    return _apply_template(HTML_DOC, subs)
 
 
 # --------------------------------------------------------------------------- #
@@ -900,17 +1628,33 @@ def main(argv=None) -> int:
     ap.add_argument("--proc-host", default="", help="override host name for --proc files")
     ap.add_argument("--proc-linux", action="append", default=[],
                     help="proctree.json from linux_proctree.py; repeatable")
+    ap.add_argument("--report-md", default="",
+                    help="Markdown report to embed as the first 'Report' tab")
+    ap.add_argument("--report-base", default="",
+                    help="base dir for resolving the report's relative image paths "
+                         "(default: the report's own directory)")
+    ap.add_argument("--embed", action="append", default=[],
+                    help="name=path: embed an HTML file as an <iframe srcdoc> "
+                         "section in the document layout; repeatable")
+    ap.add_argument("--layout", default="both", choices=["dashboard", "document", "both"],
+                    help="which HTML to write: dashboard.html, report.html, or both")
+    ap.add_argument("--signatures", default="",
+                    help="optional per-case signatures JSON (default: "
+                         "analysis/signatures.json if present)")
     ap.add_argument("--out", required=True, help="output directory")
     ap.add_argument("--title", default="Incident", help="case title")
     args = ap.parse_args(argv)
 
     os.makedirs(args.out, exist_ok=True)
 
+    set_signatures(args.signatures)
+
     iocs = read_iocs(args.iocs)
     if args.title == "Incident" and iocs.get("case"):
         args.title = iocs["case"]
     obs = iocs["observables"]
-    ipmap = ip_host_map(obs)
+    endpoints = iocs.get("endpoints", {})
+    ipmap = ip_host_map(obs, endpoints)
 
     timeline = read_timeline(args.timeline) if args.timeline else []
 
@@ -974,8 +1718,12 @@ def main(argv=None) -> int:
     # drop tree entries for endpoints that are no longer shown
     trees = {h: r for h, r in trees.items() if h in hosts}
 
-    order = ["Attacker", "SqlSvr", "DC2", "DC1", "Network"]
-    hosts_sorted = sorted(hosts, key=lambda h: (order.index(h) if h in order else 99, h))
+    # display order: case-declared endpoint order, then alphabetical; the
+    # synthetic "Network" bucket always sorts last.
+    order = endpoint_order(endpoints)
+    hosts_sorted = sorted(
+        hosts,
+        key=lambda h: (order.index(h) if h in order else 99, h != "Network", h))
 
     # trim graph nodes to json-friendly (vis needs id/label/color/size/title)
     gnodes = [{
@@ -995,8 +1743,18 @@ def main(argv=None) -> int:
         "type_colors": TYPE_COLORS,
     }
 
+    # embedded narrative report (all-in-one "Report" tab)
+    if args.report_md and os.path.isfile(args.report_md):
+        base = args.report_base or os.path.dirname(os.path.abspath(args.report_md))
+        with open(args.report_md, encoding="utf-8") as fh:
+            data["report_html"] = render_markdown(fh.read(), base)
+    else:
+        data["report_html"] = ""
+
     subtitle = ("Single-file incident dashboard — filter by endpoint; "
                 "'All endpoints' is the global view.")
+    doc_subtitle = ("Single-file incident report — narrative + per-endpoint "
+                    "data sections, each with its own filter.")
 
     # process-tree panel hint: name only the sources actually supplied
     parts, notes = [], []
@@ -1012,15 +1770,47 @@ def main(argv=None) -> int:
             treehint += " (" + "; ".join(notes) + ")"
     else:
         treehint = "No process-tree sources provided."
-    out_html = os.path.join(args.out, "dashboard.html")
-    with open(out_html, "w", encoding="utf-8") as fh:
-        fh.write(render_html(args.title, subtitle, data, treehint))
+
+    written = []
+
+    # ---- dashboard (tabbed) layout ----
+    if args.layout in ("dashboard", "both"):
+        out_html = os.path.join(args.out, "dashboard.html")
+        with open(out_html, "w", encoding="utf-8") as fh:
+            fh.write(render_html(args.title, subtitle, data, treehint))
+        written.append(out_html)
+
+    # ---- document (single-scroll) layout ----
+    if args.layout in ("document", "both"):
+        embeds = []
+        for spec in args.embed:
+            if "=" not in spec:
+                continue
+            name, path = spec.split("=", 1)
+            if not os.path.isfile(path):
+                print(f"[incident_dashboard] --embed {name}: {path} not found",
+                      file=sys.stderr)
+                continue
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                content = fh.read()
+            embeds.append(
+                f'<section class="blk" id="sec-{html.escape(name)}">'
+                f'<h2 class="blk-title"><span><span class="accent">Embedded</span>'
+                f'{html.escape(name)}</span></h2>'
+                f'<iframe class="embed" title="{html.escape(name)}" '
+                f'srcdoc="{html.escape(content, quote=True)}"></iframe>'
+                f'</section>')
+        out_doc = os.path.join(args.out, "report.html")
+        with open(out_doc, "w", encoding="utf-8") as fh:
+            fh.write(render_document(args.title, doc_subtitle, data, treehint,
+                                     "\n".join(embeds)))
+        written.append(out_doc)
 
     # also drop the machine-readable payload for reuse
     with open(os.path.join(args.out, "dashboard_data.json"), "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2, ensure_ascii=False)
 
-    print(f"[incident_dashboard] wrote {out_html}", file=sys.stderr)
+    print(f"[incident_dashboard] wrote {', '.join(written)}", file=sys.stderr)
     print(f"  hosts: {', '.join(hosts_sorted)}", file=sys.stderr)
     print(f"  timeline: {len(timeline)} | observables: {len(obs)} | "
           f"graph: {len(gnodes)}n/{len(edges)}e | tree-hosts: {len(trees)}", file=sys.stderr)

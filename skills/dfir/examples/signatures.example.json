@@ -1,0 +1,15 @@
+{
+  "_comment": "REFERENCE ONLY -- never loaded by any tool. Copy to analysis/signatures.json to use. Case-specific detection patterns that must NOT live in the reusable toolkit; analysis/ is wiped by reset_case.sh, so these never survive into the next case.",
+  "windows_process_patterns": [
+    "totally-random-binary-name",
+    "ResponderTool[.]exe"
+  ],
+  "linux_process_patterns": [
+    "some-case-specific-dropper",
+    "hidden-miner"
+  ],
+  "actor_keywords": {
+    "Attacker": ["kali", "attacker"],
+    "Responder": ["ftk", "forensic collection"]
+  }
+}

@@ -17,6 +17,12 @@ evidence, or a timeline + IOCs + report must be produced.
 - **State uncertainty.** If two techniques fit, present the stronger one and
   note the alternative.
 - **Defang IOCs** and separate windows.
+- **Promote reusable tooling.** When a bespoke parser/hunter is needed,
+  generalize it — no hardcoded host names, IPs, dates or case strings. If it is
+  broadly useful, save it under `docker/` (run via
+  `docker/dfir.sh python3 /data/tools/<tool>.py`) so it survives `reset_case.sh`
+  and is reusable next case. One-off, case-specific scripts stay in `notes/`.
+  `docker/` must contain **zero case data** (see `docker/dfir_signatures.py`).
 
 ## Engagement flow
 1. **Intake** — read the task list (`evidences/Questions.md`), inventory hosts

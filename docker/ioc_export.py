@@ -7,20 +7,24 @@ writes a flat, deterministic CSV suitable for SIEM/CTI ingestion.
 Input schema (JSON or YAML)::
 
     {
-      "case": "SaSync / shanocorp.htb",
+      "case": "<case name>",
+      "endpoints": {                       # optional, generic example
+        "10.0.0.5": {"name": "Attacker", "role": "attacker", "order": 1}
+      },
       "observables": [
         {
           "type": "ipv4",                 # required
-          "value": "192.168.186.135",     # required
-          "defanged": "192[.]168[.]186[.]135",
+          "value": "10.0.0.5",            # required
+          "defanged": "10[.]0[.]0[.]5",
           "role": "attacker-host",
-          "first_seen_utc": "2026-03-09T19:26:26Z",
-          "last_seen_utc":  "2026-03-09T19:42:47Z",
+          "first_seen_utc": "2026-01-01T00:00:00Z",
+          "last_seen_utc":  "2026-01-01T01:00:00Z",
           "confidence": "high",           # high|medium|low|benign
-          "source": "pcap; DC2 Security EID=4624",
-          "context": "Kali Linux attacker host",
+          "source": "pcap; Security EID=4624",
+          "context": "external attacker host",
           "mitre": "T1595,T1190",         # optional, comma-separated
-          "tags": ["c2", "attacker"]      # optional list -> 'c2;attacker'
+          "tags": ["c2", "attacker"],     # optional list -> 'c2;attacker'
+          "hosts": ["Attacker"]           # optional endpoint attribution
         }
       ]
     }

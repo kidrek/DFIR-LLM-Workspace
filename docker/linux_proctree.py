@@ -2,9 +2,9 @@
 """linux_proctree.py -- process tree + process-event timeline for a Linux host.
 
 Part of the container-only DFIR workspace. Built for UAC/LinuxCatScale-style
-triage collections (e.g. the `catscale_app01-*` bundle) where the live /proc
-state and the systemd journal are captured but auditd was NOT running and there
-is no memory image. It reconstructs two complementary views:
+triage collections (a bundle with a live /proc snapshot plus the systemd
+journal) where auditd was NOT running and there is no memory image. It
+reconstructs two complementary views:
 
   SNAPSHOT  exact parent/child tree from the collection instant
             (``/proc/<pid>/status`` -> PPid, ``ps -axwwSo``)
@@ -47,6 +47,12 @@ import sys
 import tarfile
 import tempfile
 from datetime import datetime, timezone, timedelta
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import dfir_signatures  # optional, per-case detection patterns
+except Exception:  # noqa: BLE001
+    dfir_signatures = None
 
 UTC = timezone.utc
 
@@ -258,7 +264,7 @@ def parse_fd_sockets(path: str) -> dict[int, list[str]]:
 
 
 def snapshot_dir_files(d: str) -> dict[str, str]:
-    """Map the canonical catscale filenames in a Process_and_Network dir."""
+    """Map the canonical triage-collection filenames in a Process_and_Network dir."""
     def find(*needles):
         for f in glob.glob(os.path.join(d, "*")):
             b = os.path.basename(f)
@@ -395,7 +401,7 @@ def _jh(s: str, tz: timezone) -> str:
     return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S")
 
 
-# "Dec 26 00:57:20 app01 systemd[1]: message"
+# "Dec 26 00:57:20 host systemd[1]: message"
 SYSLOG_TAIL = re.compile(
     r"^\S+\s+\d+\s+\d{2}:\d{2}:\d{2}\s+(\S+)\s+([\w./-]+)(?:\[(\d+)\])?:\s*(.*)$")
 
@@ -568,12 +574,28 @@ def build_snapshot_tree(nodes: dict[int, dict], roots_only=True) -> list[dict]:
     return roots
 
 
-INTERESTING = re.compile(
+INTERESTING_BASE = re.compile(
     r"\bcron\b|/dev/shm|/tmp/|\.upd\b|curl|wget|base64|bash -c|nc\b|ncat|"
-    r"socat|chisel|python3? -c|systemd-journald-helper|updat3|realm|"
+    r"socat|chisel|python3? -c|systemd-journald-helper|"
     r"sudo|/bin/su\b|\bsu\b|sshd|tmux|xterm|wsgi|uwsgi|mysql|sqlite|"
     r"velociraptor|ssh-agent",
     re.I)
+
+# Optional per-case signatures (analysis/signatures.json). Absent -> generic.
+SIGNATURES = dfir_signatures.load_signatures() if dfir_signatures else {
+    "linux_process_patterns": [], "actor_keywords": {}}
+
+
+def set_signatures(path: str = "") -> None:
+    global SIGNATURES, INTERESTING
+    if dfir_signatures is None:
+        return
+    SIGNATURES = dfir_signatures.load_signatures(path)
+    INTERESTING = dfir_signatures.compile_with(
+        INTERESTING_BASE, SIGNATURES.get("linux_process_patterns"))
+
+
+INTERESTING = INTERESTING_BASE
 
 
 def is_interesting(s: str) -> bool:
@@ -871,7 +893,7 @@ def main(argv=None) -> int:
                     help="directory of *.journal files; repeatable")
     ap.add_argument("--auth", action="append", default=[], help="auth.log path")
     ap.add_argument("--syslog", action="append", default=[], help="syslog path")
-    ap.add_argument("--host", default="app01", help="host label")
+    ap.add_argument("--host", default="linux", help="host label")
     ap.add_argument("--tz", default="UTC", help="host-local timezone (e.g. +02:00)")
     ap.add_argument("--since", default="", help="incident window start (ISO-8601 UTC)")
     ap.add_argument("--until", default="", help="incident window end (ISO-8601 UTC)")
@@ -880,7 +902,12 @@ def main(argv=None) -> int:
     ap.add_argument("--title", default="", help="case/host title")
     ap.add_argument("--formats", default="json,csv,dot,html",
                     help="comma list: json,csv,dot,html")
+    ap.add_argument("--signatures", default="",
+                    help="optional per-case signatures JSON (default: "
+                         "analysis/signatures.json if present)")
     args = ap.parse_args(argv)
+
+    set_signatures(args.signatures)
 
     tz = parse_tz(args.tz)
     now = datetime.now(UTC)

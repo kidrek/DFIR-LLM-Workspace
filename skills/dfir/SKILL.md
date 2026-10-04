@@ -34,6 +34,9 @@ Use `docker/dfir.sh` (see workspace `CLAUDE.md`). Image: `dfir-toolkit`.
   `docker/av_parse.py`
 - Coverage manifest: `/opt/forensic-artifacts` (ForensicArtifacts YAML catalog)
 - Helpers: `docker/evtx_flatten.py` (EVTX JSONL → TSV timeline),
+  `docker/evtx_query.py` (filtered fact extraction from a flattened EVTX TSV),
+  `docker/mft_query.py` (query MFTECmd `$MFT` / `$J`-USN CSV),
+  `docker/pcap_objects.py` (carve + hash protocol objects from a PCAP),
   `docker/ioc_export.py` (structured IOC JSON/YAML → flat CSV),
   `docker/incident_viz.py` (IOC/timeline/Zeek → interactive HTML + static SVG/PNG),
   `docker/incident_dashboard.py` (IOC/timeline/Zeek/4688 → one filterable,
@@ -48,6 +51,9 @@ Use `docker/dfir.sh` (see workspace `CLAUDE.md`). Image: `dfir-toolkit`.
    ```sh
    docker/dfir.sh evtx_dump_rs -o jsonl <in.evtx> > /data/analysis/<host>/evtx/<name>.jsonl
    docker/dfir.sh python3 /data/tools/evtx_flatten.py <in.jsonl> <out.tsv>
+   # then extract facts with the query helper (no ad-hoc scripting):
+   docker/dfir.sh python3 /data/tools/evtx_query.py <out.tsv> --eid 4688 \
+     --fields NewProcessName,CommandLine,ParentProcessName,SubjectUserName
    ```
 3. **Sigma triage** with Hayabusa (fast first pass):
    ```sh
@@ -55,7 +61,9 @@ Use `docker/dfir.sh` (see workspace `CLAUDE.md`). Image: `dfir-toolkit`.
      dfir-timeline -d /data/evidences/<HOST>/C/Windows/System32/Logs \
      -o /data/analysis/<HOST>/hayabusa_timeline.csv -w -q -N -C -s -U'
    ```
-4. **MFT** parse: `MFTECmd -f '.../$MFT' --csv out/`.
+4. **MFT** parse: `MFTECmd -f '.../$MFT' --csv out/` (and `$Extend/$J` for USN).
+   Query the CSV with `docker/mft_query.py` (`--name`, `--ext`, `--reason`,
+   `--time-from`, `--exclude-path`) — works for both `$MFT` and `$J` schemas.
 5. **Registry / execution artifacts**: `RECmd` (hives), `PECmd` (prefetch),
    `AmcacheParser`, `AppCompatCacheParser` (ShimCache), `SrumECmd` (SRUM),
    `LECmd`/`JLECmd` (LNK/jump lists).
@@ -64,7 +72,8 @@ Use `docker/dfir.sh` (see workspace `CLAUDE.md`). Image: `dfir-toolkit`.
 7. **macOS**: `mac_apt` for plists, unified logs, FSEvents, SQLite artifacts.
 8. **Network**: `tshark -r pcap ...`, `--export-objects http,<dir>`,
    `zeek -r pcap` (gives `http`, `smb_mapping`, `kerberos`, `dce_rpc`, `pe`,
-   `files`, `ntlm`, `ldap_search`).
+   `files`, `ntlm`, `ldap_search`). Use `docker/pcap_objects.py` to carve +
+   SHA-256-hash protocol objects into a manifest (IOC-ready).
 9. **Antivirus / EDR** (see below).
 10. **ESXi / VMware** (see below).
 11. **Correlate**: every finding is confirmed by a second artefact
@@ -115,6 +124,33 @@ Use `docker/dfir.sh` (see workspace `CLAUDE.md`). Image: `dfir-toolkit`.
     `proctree.json` from `linux_proctree.py` (repeatable) to drop a Linux
     snapshot tree into the same panel. `dashboard_data.json` holds the embedded
     payload.
+16. **All-in-one report** — fold the narrative report into the dashboard so a
+    single offline file carries both the write-up and the interactive panels:
+    ```sh
+    docker/dfir.sh python3 /data/tools/incident_dashboard.py \
+      --iocs /data/analysis/iocs.json \
+      --report-md /data/reports/incident_report.md \
+      --proc-linux /data/analysis/<LINUX_HOST>/proctree/proctree.json \
+      --out /data/reports --title "<case>"
+    ```
+    The Markdown becomes a **Report** tab (first tab); headings/tables/
+    blockquotes/lists render and relative images are inlined as data URIs, so
+    the output stays self-contained and offline.
+17. **Document report** — for a single scrolling page (report + all sections,
+    each with its own endpoint filter) add `--layout document` (or `both`) and
+    optionally embed a standalone panel:
+    ```sh
+    docker/dfir.sh python3 /data/tools/incident_dashboard.py \
+      --iocs /data/analysis/iocs.json \
+      --report-md /data/reports/incident_report.md \
+      --proc-linux /data/analysis/<LINUX_HOST>/proctree/proctree.json \
+      --embed proctree=/data/reports/viz/proctree_<HOST>.html \
+      --layout both --out /data/reports --title "<case>"
+    ```
+    Writes `reports/report.html`: report inline, sticky TOC with scroll-spy,
+    and Overview/Timeline/Actor graph/Process trees/Observables/IOCs/ATT&CK as
+    sections with per-section chips; `--embed` inserts an extra HTML as an
+    `<iframe srcdoc>`.
 
 ## ESXi / VMware analysis
 Artifacts (ForensicArtifacts `esxi.yaml`): `hostd.log`, `vmkernel.log`,
@@ -171,7 +207,25 @@ README).
   to recover or prove existence of AV-handled files.
 
 ## Query recipes
-- Process creation (Security 4688) with parent PID:
+- Preferred: use the generic helpers rather than ad-hoc scripts.
+  ```sh
+  # Security 4688 process creation with parent + user (auto field set per EID)
+  docker/dfir.sh python3 /data/tools/evtx_query.py \
+    /data/analysis/<HOST>/evtx/Security.tsv --eid 4688 \
+    --fields NewProcessName,CommandLine,ParentProcessName,SubjectUserName
+  # Kerberos RC4 TGS (Kerberoasting) from a given source
+  docker/dfir.sh python3 /data/tools/evtx_query.py .../Security.tsv --eid 4769 \
+    --field IpAddress=192\.168\. --fields ServiceName,TargetUserName,TicketEncryptionType
+  # dropped binaries by name, and USN file creations in a window
+  docker/dfir.sh python3 /data/tools/mft_query.py --csv <HOST>_MFT.csv \
+    --name 'mimikatz\.exe|nc\.exe'
+  docker/dfir.sh python3 /data/tools/mft_query.py --csv <HOST>_USN.csv \
+    --reason FileCreate --ext .exe --time-from "2026-03-09 14:16" --exclude-path WinSxS
+  # carve + hash network-borne payloads
+  docker/dfir.sh python3 /data/tools/pcap_objects.py -r <cap>.pcapng \
+    --proto http --out /data/analysis/<HOST>/pcap_objects
+  ```
+- Raw fallback (Security 4688) if a helper is unavailable:
   ```sh
   python3 - <<'PY'
   import csv,re
@@ -191,6 +245,26 @@ README).
 - Directory replication / DCSync: Security `4662` with properties
   `{1131f6aa-…}` (Get-Changes) / `{1131f6ad-…}` (Get-Changes-All).
 
+## Promoting a helper
+
+When a bespoke parser/hunter is needed, prefer the helpers above; if none fits,
+write a new one **generalized**, not case-specific. Promote a script to `docker/`
+only if **all** hold:
+
+- (a) reusable across cases;
+- (b) fully parameterized — no host/IP/date/filename baked in;
+- (c) stdlib-only, or depends only on tooling already in the image (a new
+  runtime dependency is a decision point — confirm with the analyst and update
+  the `Dockerfile`);
+- (d) runnable via `docker/dfir.sh python3 /data/tools/<tool>.py`.
+
+When you add one: verify it against a real artefact from the current case, add
+it to the toolchain lists (`skills/dfir`, `README.md`, `CLAUDE.md`) and to
+`reset_case.sh --scrub-refs`, then confirm it is **case-free** (grep for host
+names/IPs/dates). Prefer extending an existing helper over adding a
+near-duplicate. One-off, case-specific scripts stay in `notes/` (which
+`reset_case.sh` wipes, by design — `docker/` survives).
+
 ## IOC export schema
 
 Record observables in `analysis/iocs.json` (or `.yaml`). One object per
@@ -199,23 +273,33 @@ observable; `type` and `value` are required, the rest recommended:
 ```json
 {
   "case": "<case name>",
+  "endpoints": {
+    "<ip>": {"name": "Attacker", "role": "attacker", "order": 1}
+  },
   "observables": [
     {
       "type": "ipv4|mac|hostname|port|url|file-path|file-hash|share|account|command|event-id|guid|mutex|registry|domain",
-      "value": "192.168.186.135",
-      "defanged": "192[.]168[.]186[.]135",
+      "value": "10.0.0.5",
+      "defanged": "10[.]0[.]0[.]5",
       "role": "attacker-host",
-      "first_seen_utc": "2026-03-09T19:26:26Z",
-      "last_seen_utc": "2026-03-09T19:42:47Z",
+      "first_seen_utc": "2026-01-01T00:00:00Z",
+      "last_seen_utc": "2026-01-01T01:00:00Z",
       "confidence": "high|medium|low|benign",
-      "source": "pcap; DC2 Security EID=4624",
-      "context": "Kali Linux attacker host",
+      "source": "pcap; Security EID=4624",
+      "context": "external attacker host",
       "mitre": "T1595,T1190",
-      "tags": ["c2", "attacker"]
+      "tags": ["c2", "attacker"],
+      "hosts": ["Attacker"]
     }
   ]
 }
 ```
+
+The optional **`endpoints`** block names each host and sets its dashboard
+display order (`order`); `hosts` on an observable attributes it to one or more
+endpoints. Both are pure inputs — the tools carry **no built-in host names,
+IPs or case keywords**. See `skills/dfir/examples/iocs.example.json` for a full
+reference (that file is documentation only and is never loaded by a tool).
 
 Then `docker/ioc_export.py` (see workflow step 13) emits columns
 `type,value,defanged,role,first_seen_utc,last_seen_utc,confidence,source,context,mitre,tags`
@@ -235,7 +319,7 @@ you install it.
 
 ```
 time_utc,host,actor,event,technique,evidence,tags
-2026-03-09T19:27:00Z,Kali→SQLSvr,Attacker (Kali),MSSQL login over TDS (1433),T1190,PCAP tds.query,credential
+2026-01-01T00:15:00Z,FILE01,Attacker,remote logon over SMB,T1021,PCAP smb,credential
 ```
 
 - `time_utc` — ISO-8601 UTC; `technique` — comma-separated MITRE IDs;
@@ -243,6 +327,27 @@ time_utc,host,actor,event,technique,evidence,tags
 - Bootstrap it from an existing Markdown chain table with
   `incident_viz.py --from-markdown <report.md>`; it writes `timeline.csv` next to
   the visuals. Tags/techniques are auto-derived from the event text when blank.
+
+## Case-specific detection signatures
+
+The reusable tools carry **no case-specific patterns** (only well-known public
+tooling such as `mimikatz`, `psexec`, `certutil`, `nc.exe`). Anything derived
+from one engagement — a random dropper name, a responder/collection tool, an
+attacker alias — goes in an **optional** `analysis/signatures.json`:
+
+```json
+{
+  "windows_process_patterns": ["<random-dropper>", "ResponderTool[.]exe"],
+  "linux_process_patterns":   ["<case-specific-dropper>"],
+  "actor_keywords": {"Attacker": ["kali"], "Responder": ["ftk"]}
+}
+```
+
+`incident_dashboard.py`, `incident_viz.py` and `linux_proctree.py` auto-load
+`analysis/signatures.json` when present (override with `--signatures PATH`); when
+absent they fall back to the generic rules. Because `analysis/` is wiped by
+`reset_case.sh`, these patterns never survive into the next case. Reference
+only: `skills/dfir/examples/signatures.example.json` (never loaded).
 
 ## Pitfalls
 - `evtx_dump` (python-evtx) and the Rust `evtx_dump` collide — the image

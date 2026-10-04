@@ -143,9 +143,14 @@ fi
 # ---- optional: scrub leftover case references ------------------------------
 if [[ "$SCRUB_REFS" -eq 1 ]]; then
   echo "Scrubbing leftover case references from reusable files..."
-  # genericize the illustrative examples left in docstrings/schema samples
+  # The tools themselves hold no case data; only the docstrings/reference
+  # examples may carry it, so genericize those samples.
   for f in "$WS/docker/ioc_export.py" "$WS/docker/incident_viz.py" \
-           "$WS/skills/dfir/SKILL.md"; do
+           "$WS/docker/incident_dashboard.py" "$WS/docker/linux_proctree.py" \
+           "$WS/docker/evtx_query.py" "$WS/docker/mft_query.py" \
+           "$WS/docker/pcap_objects.py" \
+           "$WS/skills/dfir/SKILL.md" \
+           "$WS"/skills/dfir/examples/*.json; do
     [[ -f "$f" ]] || continue
     sed -i \
       -e 's#SaSync / shanocorp\.htb#ACME / example.local#g' \

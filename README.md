@@ -113,6 +113,69 @@ Mounts:
 - `/data/notes`     -> `notes/`    (read-write)
 - `/data/tools`     -> `docker/`   (read-only)
 
+## Guided analysis (Incident Handler agent)
+
+`opencode.jsonc` registers the template's `skills/` with OpenCode and sets the
+**Incident Handler** primary agent as the default, so a new `opencode` session
+inside a case copy starts in guided mode.
+
+The agent loads `skills/incident-handler`, reads the case task list, and walks
+the analyst through the engagement one step at a time — objective, the exact
+`docker/dfir.sh` command, what to look for, and which task it answers — while
+delegating parsing mechanics to the `dfir` skill. It keeps a running
+`analysis/task_tracking.md` and denies edits under `evidences/`.
+
+### Quick start: `/analyse`
+
+Once evidence is in `evidences/`, start the pipeline with the slash command
+**`/analyse`** (defined in `.opencode/commands/analyse.md`). It runs in the
+default **Incident Handler** agent and injects the standard objective, so you
+don't have to pick the agent or restate the goal:
+
+> Analyse the evidence and produce an incident timeline
+
+It is the entry point to the analyst pipeline once evidence is dropped. The
+command hands that objective to the guided flow — intake and task tracking,
+chain-of-custody hashing, triage, parsing, correlation, the UTC timeline, the
+visuals/dashboard and the final report — and walks it **one step at a time**,
+each step presented as **Objective → exact `docker/dfir.sh` command → what to
+look for → what it concludes**.
+
+**Placement:** inside OpenCode (Incident Handler agent). It takes no arguments;
+to steer a specific host or task, state it in the prompt.
+
+To use a different agent for a session, pick it from the agent switcher; the
+default only affects new sessions.
+
+### Example session
+
+Start the default **Incident Handler** agent and give it the case prompt:
+
+> Analyse the evidence and produce an incident timeline.
+
+The agent then walks the engagement one step at a time; for this prompt it
+suggests:
+
+1. **Intake** — read `evidences/Questions.md`, inventory hosts and evidence
+   types, and open `analysis/task_tracking.md`.
+2. **Chain of custody** — SHA-256 every evidence file into `analysis/hashes/`
+   (before and after analysis).
+3. **Triage** — Hayabusa/Chainsaw Sigma + ATT&CK pass per host; separate
+   adversary activity from responder/forensic-tool activity.
+4. **Parse** — export per-source EVTX to JSON, `$MFT` to CSV, PCAP to Zeek,
+   registry hives to CSV, and build a `plaso` super-timeline.
+5. **Correlate** — consolidate a UTC super-timeline and cross-verify each
+   finding against a second independent artifact (log ↔ PCAP ↔ `$MFT`).
+6. **Timeline** — assemble the consolidated UTC attack chain (the incident
+   timeline deliverable).
+7. **Visualize / dashboard** — render `reports/viz/*` and
+   `reports/dashboard.html` from `analysis/iocs.json`, the timeline and Zeek.
+8. **Report** — write the deliverable to `reports/` with per-task answers,
+   evidence citations, defanged IOCs, ATT&CK mapping and gaps/unknowns.
+
+Each step is presented as **Objective → exact `docker/dfir.sh` command → what
+to look for → what it concludes and the next step**.
+
 ## Tooling highlights
 
 - **Windows:** EVTX (`evtx_dump_rs`, Hayabusa, Chainsaw, Sigma), `MFTECmd`,
@@ -425,70 +488,6 @@ Two complementary all-in-one layouts are produced from the same data:
   the timeline row carrying its `Rec=`, else the earliest linked event). Derived
   values are marked `*` in the table (hover shows the reference); nothing is
   guessed when no evidence supports it.
-
-
-## Guided analysis (Incident Handler agent)
-
-`opencode.jsonc` registers the template's `skills/` with OpenCode and sets the
-**Incident Handler** primary agent as the default, so a new `opencode` session
-inside a case copy starts in guided mode.
-
-The agent loads `skills/incident-handler`, reads the case task list, and walks
-the analyst through the engagement one step at a time — objective, the exact
-`docker/dfir.sh` command, what to look for, and which task it answers — while
-delegating parsing mechanics to the `dfir` skill. It keeps a running
-`analysis/task_tracking.md` and denies edits under `evidences/`.
-
-### Quick start: `/analyse`
-
-Once evidence is in `evidences/`, start the pipeline with the slash command
-**`/analyse`** (defined in `.opencode/commands/analyse.md`). It runs in the
-default **Incident Handler** agent and injects the standard objective, so you
-don't have to pick the agent or restate the goal:
-
-> Analyse the evidence and produce an incident timeline
-
-It is the entry point to the analyst pipeline once evidence is dropped. The
-command hands that objective to the guided flow — intake and task tracking,
-chain-of-custody hashing, triage, parsing, correlation, the UTC timeline, the
-visuals/dashboard and the final report — and walks it **one step at a time**,
-each step presented as **Objective → exact `docker/dfir.sh` command → what to
-look for → what it concludes**.
-
-**Placement:** inside OpenCode (Incident Handler agent). It takes no arguments;
-to steer a specific host or task, state it in the prompt.
-
-To use a different agent for a session, pick it from the agent switcher; the
-default only affects new sessions.
-
-### Example session
-
-Start the default **Incident Handler** agent and give it the case prompt:
-
-> Analyse the evidence and produce an incident timeline.
-
-The agent then walks the engagement one step at a time; for this prompt it
-suggests:
-
-1. **Intake** — read `evidences/Questions.md`, inventory hosts and evidence
-   types, and open `analysis/task_tracking.md`.
-2. **Chain of custody** — SHA-256 every evidence file into `analysis/hashes/`
-   (before and after analysis).
-3. **Triage** — Hayabusa/Chainsaw Sigma + ATT&CK pass per host; separate
-   adversary activity from responder/forensic-tool activity.
-4. **Parse** — export per-source EVTX to JSON, `$MFT` to CSV, PCAP to Zeek,
-   registry hives to CSV, and build a `plaso` super-timeline.
-5. **Correlate** — consolidate a UTC super-timeline and cross-verify each
-   finding against a second independent artifact (log ↔ PCAP ↔ `$MFT`).
-6. **Timeline** — assemble the consolidated UTC attack chain (the incident
-   timeline deliverable).
-7. **Visualize / dashboard** — render `reports/viz/*` and
-   `reports/dashboard.html` from `analysis/iocs.json`, the timeline and Zeek.
-8. **Report** — write the deliverable to `reports/` with per-task answers,
-   evidence citations, defanged IOCs, ATT&CK mapping and gaps/unknowns.
-
-Each step is presented as **Objective → exact `docker/dfir.sh` command → what
-to look for → what it concludes and the next step**.
 
 ## Not included
 

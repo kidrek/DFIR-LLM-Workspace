@@ -17,7 +17,7 @@ risk from it.
 | `notes/` | Working notes and scratch. | Yes |
 | `docker/` | Toolchain image (`Dockerfile`) and wrapper (`dfir.sh`). Reusable. | Yes |
 | `skills/` | Agent skill definitions (`dfir`, `incident-handler`). Reusable. | Yes |
-| `.opencode/` | Agent definitions and commands (`reset-case`). Project-local; copies with the template. | Yes |
+| `.opencode/` | Agent definitions and commands (`analyse`, `reset-case`). Project-local; copies with the template. | Yes |
 | `opencode.jsonc` | OpenCode config: registers `skills/` and auto-starts the Incident Handler. | Yes |
 | `reset_case.sh` | Reset the workspace for a new case (dry-run by default). Reusable. | Yes |
 
@@ -237,7 +237,9 @@ verbatim for future cases.
 `reports/`, `notes/`) but keeps the reusable template and every `.gitkeep`. It
 is **dry-run by default**; add `--yes` to apply. Flags: `--keep-evidence`,
 `--scrub-refs` (genericize leftover case examples), `--reset-git`. Inside
-OpenCode the same flow is the slash command `/reset-case`.
+OpenCode the same flow is the slash command `/reset-case`. The companion
+`/analyse` command starts the guided analysis pipeline once evidence is dropped
+(see the README, "Guided analysis").
 
 > This overrides the "do not delete evidence" rule for **template reset only**.
 > Archive any evidence you still need first; never run it on a live case

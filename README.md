@@ -15,7 +15,7 @@ per case; the evidence never leaves the read-only mount.
 | `notes/` | Working notes and scratch. | Yes |
 | `docker/` | Toolchain image (`Dockerfile`) and wrapper (`dfir.sh`). Reusable. | Yes |
 | `skills/` | Agent skill definitions (`dfir`, `incident-handler`). Reusable. | Yes |
-| `.opencode/` | Agent definitions (`incident-handler`) and commands (`reset-case`). Reusable. | Yes |
+| `.opencode/` | Agent definitions (`incident-handler`) and commands (`analyse`, `reset-case`). Reusable. | Yes |
 | `opencode.jsonc` | OpenCode config: registers `skills/`, auto-starts the Incident Handler. | Yes |
 | `reset_case.sh` | Reset the workspace for a new case (dry-run by default). Reusable. | Yes |
 
@@ -438,6 +438,25 @@ the analyst through the engagement one step at a time — objective, the exact
 `docker/dfir.sh` command, what to look for, and which task it answers — while
 delegating parsing mechanics to the `dfir` skill. It keeps a running
 `analysis/task_tracking.md` and denies edits under `evidences/`.
+
+### Quick start: `/analyse`
+
+Once evidence is in `evidences/`, start the pipeline with the slash command
+**`/analyse`** (defined in `.opencode/commands/analyse.md`). It runs in the
+default **Incident Handler** agent and injects the standard objective, so you
+don't have to pick the agent or restate the goal:
+
+> Analyse the evidence and produce an incident timeline
+
+It is the entry point to the analyst pipeline once evidence is dropped. The
+command hands that objective to the guided flow — intake and task tracking,
+chain-of-custody hashing, triage, parsing, correlation, the UTC timeline, the
+visuals/dashboard and the final report — and walks it **one step at a time**,
+each step presented as **Objective → exact `docker/dfir.sh` command → what to
+look for → what it concludes**.
+
+**Placement:** inside OpenCode (Incident Handler agent). It takes no arguments;
+to steer a specific host or task, state it in the prompt.
 
 To use a different agent for a session, pick it from the agent switcher; the
 default only affects new sessions.

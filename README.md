@@ -42,76 +42,7 @@ This template is used **manually** — copy it, then work inside the copy.
 # 1. Copy the template to a new case directory
 cp -r ~/Documents/DFIR_Workspace_template ~/Cases/<case-name>
 cd ~/Cases/<case-name>
-
-# 2. Re-initialize version control (the template's history is not the case's)
-rm -rf .git && git init
-
-# 3. Drop evidence into evidences/ (keep original archives intact)
-#    and put the case task list at evidences/Questions.md if you have one.
-
-# 4. Inventory & hash evidence (chain of custody). import-of-record is the
-#    baseline; re-run 'verify' after analysis and require exit 0.
-docker/dfir.sh python3 /data/tools/custody.py hash \
-  --label intake /data/evidences
-
-# 5. Run a tool
-docker/dfir.sh hayabusa dfir-timeline \
-  -d /data/evidences/<HOST>/C/Windows/System32/winevt/Logs \
-  -o /data/analysis/<HOST>/hayabusa_timeline.csv
 ```
-
-## Reset for a new case
-
-`reset_case.sh` clears the case-specific content (evidence, `analysis/`,
-`reports/`, `notes/`) while preserving the reusable template (`docker/`,
-`skills/`, `.opencode/`, docs, and every `.gitkeep`). It is **dry-run by
-default** — nothing is deleted until you pass `--yes`.
-
-> This deliberately overrides the workspace rule "do not delete evidence". It is
-> a **template reset only**: archive any evidence you still need first, and
-> **never run it on a live case mid-investigation**.
-
-```sh
-./reset_case.sh                  # dry-run: show exactly what would be removed
-./reset_case.sh --yes            # apply the reset
-./reset_case.sh --yes --keep-evidence   # keep evidences/, reset the rest
-./reset_case.sh --yes --scrub-refs      # also genericize leftover case examples
-./reset_case.sh --yes --reset-git       # also rm -rf .git && git init
-```
-
-It auto-detects the case name from `analysis/iocs.json` / the report title, and
-after cleaning scans the reusable tree for residual case references and warns.
-The same operation is available as the slash command **`/reset-case`** inside
-OpenCode (analyst or agent): it runs the dry-run, asks for confirmation, then
-applies. `/reset-case --keep-evidence` passes flags through.
-
-## Wrapper usage
-
-`docker/dfir.sh` enforces read-only evidence, ephemeral (`--rm`) containers,
-non-root execution, no network by default, and a hardened container (all Linux
-capabilities dropped, `no-new-privileges`, a `noexec/nosuid/nodev` `/tmp` tmpfs,
-and pids/memory/cpu limits).
-
-```sh
-docker/dfir.sh [--net] [--image IMG] [--shell] [--privileged-cap] \
-               [--no-hardening] <command> [args...]
-```
-
-- `--privileged-cap` adds `SYS_ADMIN` + `/dev/fuse` + `apparmor:unconfined`;
-  needed only for the read-only VMFS/VMDK mounts (`vmfs-fuse`, `qemu-nbd`).
-- `--no-hardening` disables the hardening flags (last resort).
-- Limits default to 4 GB / 4 CPUs and a 2 GB `/tmp`; override with
-  `DFIR_MEM` / `DFIR_CPUS` / `DFIR_TMP_SIZE`.
-
-Build reproducibility: Python packages are pinned in `docker/constraints.txt`.
-
-Mounts:
-
-- `/data/evidences` -> `evidences/` (read-only)
-- `/data/analysis`  -> `analysis/` (read-write, also `/data/out`)
-- `/data/reports`   -> `reports/`  (read-write)
-- `/data/notes`     -> `notes/`    (read-write)
-- `/data/tools`     -> `docker/`   (read-only)
 
 ## Guided analysis (Incident Handler agent)
 
@@ -175,6 +106,59 @@ suggests:
 
 Each step is presented as **Objective → exact `docker/dfir.sh` command → what
 to look for → what it concludes and the next step**.
+
+## Reset for a new case
+
+`reset_case.sh` clears the case-specific content (evidence, `analysis/`,
+`reports/`, `notes/`) while preserving the reusable template (`docker/`,
+`skills/`, `.opencode/`, docs, and every `.gitkeep`). It is **dry-run by
+default** — nothing is deleted until you pass `--yes`.
+
+> This deliberately overrides the workspace rule "do not delete evidence". It is
+> a **template reset only**: archive any evidence you still need first, and
+> **never run it on a live case mid-investigation**.
+
+```sh
+./reset_case.sh                  # dry-run: show exactly what would be removed
+./reset_case.sh --yes            # apply the reset
+./reset_case.sh --yes --keep-evidence   # keep evidences/, reset the rest
+./reset_case.sh --yes --scrub-refs      # also genericize leftover case examples
+./reset_case.sh --yes --reset-git       # also rm -rf .git && git init
+```
+
+It auto-detects the case name from `analysis/iocs.json` / the report title, and
+after cleaning scans the reusable tree for residual case references and warns.
+The same operation is available as the slash command **`/reset-case`** inside
+OpenCode (analyst or agent): it runs the dry-run, asks for confirmation, then
+applies. `/reset-case --keep-evidence` passes flags through.
+
+## Wrapper usage
+
+`docker/dfir.sh` enforces read-only evidence, ephemeral (`--rm`) containers,
+non-root execution, no network by default, and a hardened container (all Linux
+capabilities dropped, `no-new-privileges`, a `noexec/nosuid/nodev` `/tmp` tmpfs,
+and pids/memory/cpu limits).
+
+```sh
+docker/dfir.sh [--net] [--image IMG] [--shell] [--privileged-cap] \
+               [--no-hardening] <command> [args...]
+```
+
+- `--privileged-cap` adds `SYS_ADMIN` + `/dev/fuse` + `apparmor:unconfined`;
+  needed only for the read-only VMFS/VMDK mounts (`vmfs-fuse`, `qemu-nbd`).
+- `--no-hardening` disables the hardening flags (last resort).
+- Limits default to 4 GB / 4 CPUs and a 2 GB `/tmp`; override with
+  `DFIR_MEM` / `DFIR_CPUS` / `DFIR_TMP_SIZE`.
+
+Build reproducibility: Python packages are pinned in `docker/constraints.txt`.
+
+Mounts:
+
+- `/data/evidences` -> `evidences/` (read-only)
+- `/data/analysis`  -> `analysis/` (read-write, also `/data/out`)
+- `/data/reports`   -> `reports/`  (read-write)
+- `/data/notes`     -> `notes/`    (read-write)
+- `/data/tools`     -> `docker/`   (read-only)
 
 ## Tooling highlights
 

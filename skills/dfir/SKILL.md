@@ -46,7 +46,9 @@ Use `docker/dfir.sh` (see workspace `CLAUDE.md`). Image: `dfir-toolkit`.
   `docker/merge_timeline.py` (parsed artifacts → normalized timeline CSV),
   `docker/incident_viz.py` (IOC/timeline/Zeek → interactive HTML + static SVG/PNG),
   `docker/incident_dashboard.py` (IOC/timeline/Zeek/4688 → one filterable,
-  per-endpoint dashboard HTML), `docker/custody.py` (chain-of-custody
+  per-endpoint dashboard HTML; wrapper `docker/build_dashboard.sh` assembles
+  the full invocation and auto-discovers the `--proc` inputs), `docker/custody.py`
+  (chain-of-custody
   hash/verify), and `docker/selftest.sh` (toolkit self-tests vs. fixtures).
 
 ## Standard workflow
@@ -149,25 +151,39 @@ Use `docker/dfir.sh` (see workspace `CLAUDE.md`). Image: `dfir-toolkit`.
     (`viz/attack_timeline.png`) so the `reports/` tree is self-contained.
 15. **Endpoint dashboard** — aggregate everything into ONE filterable file so an
     analyst can scope the incident to a single host. Add `hosts: [...]` to each
-    IOC first (auto-inferred from `source`/`context` when absent):
+    IOC first (auto-inferred from `source`/`context` when absent). The wrapper
+    discovers every input (one `--proc` per `Security.tsv`, timeline, Zeek,
+    report) so no step is silently omitted — prefer it:
+    ```sh
+    docker/build_dashboard.sh --strict
+    ```
+    Or call the generator directly:
     ```sh
     docker/dfir.sh python3 /data/tools/incident_dashboard.py \
       --iocs /data/analysis/iocs.json \
       --timeline /data/reports/viz/timeline.csv \
       --zeek /data/analysis/network/zeek \
       --ip-map /data/analysis/ip_map.json \
-      --proc /data/analysis/<HOST>/evtx/Security.tsv \
+      --proc /data/analysis/<HOST>/evtx/tsv/Security.tsv \
       --proc-linux /data/analysis/<LINUX_HOST>/proctree/proctree.json \
       --out /data/reports --title "<case>"
     ```
     Produces `reports/dashboard.html` (self-contained: timeline, actor graph,
     process trees, observables, IOCs, ATT&CK) with a client-side **endpoint
     filter** ("All endpoints" = global). `--proc` takes flattened Security 4688
-    TSVs (repeatable); parentage is resolved by PID + time so a PID reused after
-    a reboot does not merge unrelated processes. `--proc-linux` takes a
-    `proctree.json` from `linux_proctree.py` (repeatable) to drop a Linux
-    snapshot tree into the same panel. `dashboard_data.json` holds the embedded
-    payload.
+    TSVs (repeatable); **if omitted it is auto-discovered** from
+    `analysis/*/evtx/tsv/Security.tsv`. Parentage is resolved by PID + time so a
+    PID reused after a reboot does not merge unrelated processes. `--proc-linux`
+    takes a `proctree.json` from `linux_proctree.py` (repeatable) to drop a
+    Linux snapshot tree into the same panel. `dashboard_data.json` holds the
+    embedded payload.
+    - **`--strict`** exits non-zero when process sources exist but no trees are
+      produced (the silently-empty-panel bug).
+    - A tree host that is not a declared endpoint is **dropped with a warning**;
+      add its FQDN/short name to `--ip-map` `endpoints[].aliases`.
+    - `--ip-map` must be the IOC `endpoints` block or a JSON map
+      `{"endpoints": {"<ip/fqdn>": {"name": "DC01", "aliases": [...]}}}` (a flat
+      `{"key": {"name": ...}}` map is also accepted).
 16. **All-in-one report** — fold the narrative report into the dashboard so a
     single offline file carries both the write-up and the interactive panels:
     ```sh

@@ -405,6 +405,16 @@ client-side **endpoint filter** — so an analyst can answer "what happened on
 this host?" without cross-referencing separate files. "All endpoints" is the
 global view.
 
+The simplest way to build it is the wrapper, which discovers every input
+(including one `--proc` per `Security.tsv`) so nothing is omitted:
+
+```sh
+docker/build_dashboard.sh --strict          # title taken from iocs.json
+docker/build_dashboard.sh --title "Case" --strict
+```
+
+Or call the generator directly:
+
 ```sh
 docker/dfir.sh python3 /data/tools/incident_dashboard.py \
   --iocs     /data/analysis/iocs.json \
@@ -414,6 +424,15 @@ docker/dfir.sh python3 /data/tools/incident_dashboard.py \
   --proc     /data/analysis/<HOST>/evtx/Security.tsv \
   --proc     /data/analysis/<HOST2>/evtx/Security.tsv \
   --out      /data/reports --title "Incident report"
+```
+
+`--ip-map` names hosts and must be either the IOC `endpoints` block or a JSON
+map in this shape (a flat `{"key": {"name": ...}}` object is also accepted):
+
+```json
+{"endpoints": {
+  "10.0.0.30": {"name": "DC01", "role": "victim", "order": 3,
+                "aliases": ["dc01", "dc01.corp.example"]}}}
 ```
 
 `--attack-timeline` is the **curated attack-chain** CSV (same
@@ -457,6 +476,14 @@ Two complementary all-in-one layouts are produced from the same data:
   `wevtutil cl` calls) are collapsed with ×N. The Linux path carries exact
   snapshot `PPid`; journal-inferred edges stay in the standalone
   `proctree.html`.
+  - **`--proc` is auto-discovered** from `analysis/*/evtx/tsv/Security.tsv`
+    when omitted, so the panel is never silently empty. `--no-proc-autodiscover`
+    disables it; `--strict` exits non-zero when process sources exist but no
+    trees are produced (e.g. a host label that does not map to a known
+    endpoint).
+  - A tree host that is not a declared endpoint is **dropped with a warning** —
+    add the FQDN/short-name to the `--ip-map` `endpoints` `aliases` so it maps
+    to the display name.
 - Panels: **Overview**, **Timeline**, **Actor graph**, **Process trees**,
   **Observables** (all, incl. benign), **IOCs** (benign removed), **ATT&CK**.
 - **Timeline scoped to the attack chain** — the timeline opens on the **curated

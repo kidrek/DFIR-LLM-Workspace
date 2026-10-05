@@ -243,6 +243,89 @@ def test_hostmap() -> None:
     check("empty -> Unknown", hm.norm_host("", m) == "Unknown")
 
 
+def test_incident_dashboard() -> None:
+    """incident_dashboard renders non-empty process trees and normalises hosts.
+
+    Regression guard for the "empty Process trees" bug: the panel is only
+    populated from --proc, and a host label that does not map to a known
+    endpoint (e.g. an FQDN with no alias) silently drops the whole tree.
+    """
+    print("incident_dashboard (process trees, host normalisation, strict)")
+    tsv = os.path.join(FIX, "sample_proc_security.tsv")
+    with tempfile.TemporaryDirectory() as td:
+        # iocs.json: endpoints carry the FQDN alias so the tree host resolves.
+        iocs = {
+            "case": "unit-test",
+            "endpoints": {
+                "10.0.0.10": {"name": "FILESRV", "role": "victim", "order": 1,
+                              "aliases": ["filesrv",
+                                          "filesrv.corp.example"]},
+            },
+            "observables": [
+                {"type": "ipv4", "value": "10.0.0.10", "hosts": ["FILESRV"]},
+            ],
+        }
+        iocs_path = os.path.join(td, "iocs.json")
+        with open(iocs_path, "w", encoding="utf-8") as fh:
+            json.dump(iocs, fh)
+
+        out = os.path.join(td, "out")
+        p = run([os.path.join(DOCKER, "incident_dashboard.py"),
+                 "--iocs", iocs_path, "--ip-map", iocs_path,
+                 "--proc", tsv, "--strict", "--out", out, "--title", "t"])
+        check("exit 0", p.returncode == 0, p.stderr.strip())
+        payload = os.path.join(out, "dashboard_data.json")
+        check("payload written", os.path.isfile(payload), payload)
+        with open(payload, encoding="utf-8") as fh:
+            data = json.load(fh)
+
+        trees = data.get("trees", {})
+        check("trees non-empty", any(trees.values()),
+              f"trees keys={list(trees)}")
+        check("FQDN mapped to endpoint (not short lowercase)",
+              "FILESRV" in trees, f"trees keys={list(trees)}")
+
+        def names(nodes):
+            for n in nodes:
+                yield n["name"]
+                yield from names(n["children"])
+
+        joined = " ".join(n for roots in trees.values() for n in names(roots))
+        check("cmd.exe in tree", "cmd.exe" in joined, joined)
+        check("certutil.exe in tree", "certutil.exe" in joined, joined)
+
+    # hostmap must turn a flat {"key": {"name": ...}} map into real names and
+    # read FQDN aliases -- never the repr of the dict.
+    import hostmap as hm
+    with tempfile.TemporaryDirectory() as td:
+        flat = os.path.join(td, "flat.json")
+        with open(flat, "w", encoding="utf-8") as fh:
+            json.dump({"10.0.0.10": {"name": "FILESRV",
+                                     "aliases": ["filesrv.corp.example"]}}, fh)
+        m = hm.load_map(flat)
+        check("flat dict form -> name", m.get("10.0.0.10") == "FILESRV",
+              str(m))
+        check("flat dict aliases read",
+              m.get("filesrv.corp.example") == "FILESRV", str(m))
+        check("no stringified dict",
+              all("{" not in v for v in m.values()), str(m))
+
+    # A host label that maps to no known endpoint drops the tree; with --strict
+    # and process sources present that must fail loudly rather than emit a
+    # silently empty panel.
+    with tempfile.TemporaryDirectory() as td:
+        iocs_path = os.path.join(td, "iocs.json")
+        with open(iocs_path, "w", encoding="utf-8") as fh:
+            json.dump({"observables": []}, fh)
+        p2 = run([os.path.join(DOCKER, "incident_dashboard.py"),
+                  "--iocs", iocs_path, "--proc", tsv,
+                  "--proc-host", "UNKNOWNHOST", "--strict",
+                  "--no-proc-autodiscover",
+                  "--out", os.path.join(td, "out2")])
+        check("strict fails when sources produce no shown trees",
+              p2.returncode == 1, f"rc={p2.returncode} {p2.stderr.strip()}")
+
+
 def test_ioc_schema_and_export() -> None:
     """ioc_export validates/dedupes; the shared schema flags bad input."""
     print("ioc_export / ioc_schema (validate, dedupe, defang)")
@@ -328,7 +411,8 @@ def test_ioc_collect() -> None:
 def main() -> int:
     for fn in (test_pipe_codec, test_evtx_flatten_end_to_end, test_evtx_query,
                test_mft_query, test_custody,
-               test_merge_timeline, test_hostmap, test_ioc_schema_and_export,
+               test_merge_timeline, test_hostmap, test_incident_dashboard,
+               test_ioc_schema_and_export,
                test_ioc_collect, test_launchers):
         try:
             fn()

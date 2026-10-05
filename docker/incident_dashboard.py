@@ -16,7 +16,9 @@ into a SINGLE offline HTML file:
   --zeek        directory of Zeek *.log (adds observed network edges)
   --proc        one or more flattened Security.tsv files (4688) for process
                 trees; may be repeated. Host name taken from the `computer`
-                column, else from --proc-host
+                column, else from --proc-host. If omitted, the files are
+                auto-discovered from analysis/*/evtx/tsv/Security.tsv so the
+                Process-trees panel is never silently empty.
   --out         output directory (default reports/)
 
 Output: ``reports/dashboard.html`` -- a single file with vis.js inlined, so it
@@ -626,6 +628,26 @@ def build_trees(events: list[dict]) -> dict[str, list[dict]]:
             merged.append(r)
         trees[host] = merged
     return trees
+
+
+def discover_proc_files(root: str = "analysis") -> list[str]:
+    """Find flattened Security.tsv files under ``root`` for ``--proc``.
+
+    Looks for ``<root>/<HOST>/evtx/tsv/Security.tsv`` (the standard layout of
+    the dfir skill). Used to auto-populate process trees when the caller forgot
+    ``--proc`` -- the failure mode that silently produced an empty Process-trees
+    panel. Returns a sorted, de-duplicated list.
+    """
+    import glob as _glob
+    hits: list[str] = []
+    for pat in ("*/evtx/tsv/Security.tsv", "*/evtx/Security.tsv",
+                "*/Security.tsv"):
+        hits += _glob.glob(os.path.join(root, pat))
+    out: list[str] = []
+    for h in sorted(set(hits)):
+        if os.path.isfile(h) and h not in out:
+            out.append(h)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -2007,8 +2029,14 @@ def main(argv=None) -> int:
     ap.add_argument("--graph", help="prebuilt graph.json (else rebuilt from IOCs + Zeek)")
     ap.add_argument("--zeek", help="directory of Zeek *.log")
     ap.add_argument("--proc", action="append", default=[],
-                    help="flattened Security.tsv (4688); repeatable")
+                    help="flattened Security.tsv (4688); repeatable. If omitted, "
+                         "<analysis>/*/evtx/tsv/Security.tsv is auto-discovered.")
     ap.add_argument("--proc-host", default="", help="override host name for --proc files")
+    ap.add_argument("--no-proc-autodiscover", action="store_true",
+                    help="do not auto-discover Security.tsv when --proc is omitted")
+    ap.add_argument("--strict", action="store_true",
+                    help="exit non-zero when process sources exist but no trees "
+                         "are produced (guards against a silently empty panel)")
     ap.add_argument("--proc-linux", action="append", default=[],
                     help="proctree.json from linux_proctree.py; repeatable")
     ap.add_argument("--report-md", default="",
@@ -2088,8 +2116,25 @@ def main(argv=None) -> int:
         nodes, edges = build_graph(iocs, zeek_edges, ipmap)
 
     # process trees
+    proc_files = list(args.proc)
+    proc_autodiscovered = False
+    if not proc_files and not args.no_proc_autodiscover:
+        auto = discover_proc_files("analysis")
+        if auto:
+            proc_files = auto
+            proc_autodiscovered = True
+            print("[incident_dashboard] no --proc given; auto-discovered "
+                  f"{len(auto)} Security.tsv: {', '.join(auto)}", file=sys.stderr)
+    if not proc_files and not args.proc_linux:
+        print("[incident_dashboard] WARNING: no process source (--proc / "
+              "--proc-linux) and none auto-discovered under analysis/ -- the "
+              "Process-trees panel will be empty.", file=sys.stderr)
     events = []
-    for p in args.proc:
+    for p in proc_files:
+        if not os.path.isfile(p):
+            print(f"[incident_dashboard] WARNING: --proc {p} not found",
+                  file=sys.stderr)
+            continue
         events += read_process_events(p, args.proc_host)
     trees = build_trees(events)
     for p in args.proc_linux:
@@ -2099,6 +2144,11 @@ def main(argv=None) -> int:
                 trees[lhost] = lroots
             else:
                 trees.setdefault(lhost, [])
+    if events and not any(trees.values()):
+        print(f"[incident_dashboard] WARNING: parsed {len(events)} process "
+              "event(s) but produced no process trees -- check host-name "
+              "normalisation (--ip-map aliases) and 4688 field parsing.",
+              file=sys.stderr)
 
     # host universe ---------------------------------------------------------
     # Rule: an endpoint is only shown when it has data in at least one of the
@@ -2130,7 +2180,15 @@ def main(argv=None) -> int:
     hosts = set(keep)
     hosts.discard("")
     # drop tree entries for endpoints that are no longer shown
+    tree_hosts_before = {h for h, r in trees.items() if r}
     trees = {h: r for h, r in trees.items() if h in hosts}
+    _dropped = sorted(h for h in tree_hosts_before if h not in trees)
+    if _dropped:
+        print("[incident_dashboard] WARNING: process trees for "
+              f"{', '.join(_dropped)} were dropped because the host name is "
+              "not a known endpoint. Add it to the --ip-map endpoints/aliases "
+              "(e.g. FQDN -> short name) so its tree is displayed.",
+              file=sys.stderr)
 
     # display order: case-declared endpoint order, then alphabetical; the
     # synthetic "Network" bucket always sorts last.
@@ -2240,6 +2298,10 @@ def main(argv=None) -> int:
     print(f"  timeline linked to observables: "
           f"{sum(1 for r in timeline if r.get('observables'))} | "
           f"first-seen derived: {_derived}", file=sys.stderr)
+    if args.strict and events and not any(trees.values()):
+        print("[incident_dashboard] --strict: process sources present but no "
+              "trees produced; failing.", file=sys.stderr)
+        return 1
     return 0
 
 

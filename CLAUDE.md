@@ -134,6 +134,13 @@ loosen these.
   Zeek logs. Visuals are deliverables written beside the report (convention
   `reports/viz/`): single-file offline HTML (JS inlined from `/opt/viz-assets`)
   plus optional static SVG/PNG (`matplotlib`/`networkx`).
+- **Endpoint dashboard:** helper `docker/incident_dashboard.py` (wrapper
+  `docker/build_dashboard.sh`) — one self-contained, filterable HTML
+  (`reports/dashboard.html`) scoping timeline, actor graph, **process trees**,
+  observables, IOCs and ATT&CK by endpoint. Process trees come from flattened
+  Security 4688 (`--proc`), **auto-discovered** from
+  `analysis/*/evtx/tsv/Security.tsv` when omitted; `--strict` fails if sources
+  exist but no trees are produced.
 - **Utilities:** `jq`, `ripgrep`, `file`, `sha256sum`, `dfir-unfurl`.
 
 Python dependencies are version-pinned in `docker/constraints.txt` (reproducible

@@ -42,9 +42,12 @@ evidence, or a timeline + IOCs + report must be produced.
    Zeek logs) with `docker/incident_viz.py`; reference the HTML/SVG from the
    report (see dfir skill, workflow step 14).
 9. **Endpoint dashboard** — build the single-file, filterable dashboard
-   (`reports/dashboard.html`) with `docker/incident_dashboard.py`; it aggregates
-   timeline, actor graph, process trees, observables, IOCs and the ATT&CK matrix
-   and scopes them by endpoint (see dfir skill, workflow step 15).
+   (`reports/dashboard.html`) with `docker/build_dashboard.sh --strict` (wrapper
+   over `docker/incident_dashboard.py`; it auto-discovers one `--proc` per
+   `Security.tsv`). It aggregates timeline, actor graph, process trees,
+   observables, IOCs and the ATT&CK matrix and scopes them by endpoint; the
+   `--strict` flag fails if process sources exist but no trees are produced
+   (see dfir skill, workflow step 15).
 10. **Report** — executive summary, per-task answers with evidence, IOCs,
     ATT&CK mapping, gaps/unknowns.
 

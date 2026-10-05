@@ -30,12 +30,37 @@ NETWORK_BUCKET = "Network"
 _FQDN_RE = re.compile(r"^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
 
 
+def _endpoint_name(meta) -> str:
+    """Extract a display name from an endpoint value.
+
+    Accepts a plain string (``{"key": "NAME"}``) or an object
+    (``{"key": {"name": "NAME", ...}}``). Returns the name only -- never the
+    ``repr`` of a dict, which is how an earlier version produced labels like
+    ``"{'name': 'Attacker', ...}"`` instead of ``Attacker``.
+    """
+    if isinstance(meta, dict):
+        return str(meta.get("name") or meta.get("host") or "")
+    return str(meta) if meta not in (None, "") else ""
+
+
+def _aliases_of(meta) -> list[str]:
+    """Return the optional ``aliases`` list from an endpoint object."""
+    if isinstance(meta, dict):
+        return [str(a) for a in (meta.get("aliases") or []) if str(a)]
+    return []
+
+
 def load_map(path: str) -> dict[str, str]:
     """Load a host map from JSON.
 
     Accepts either an ``endpoints`` inventory (with optional ``aliases``) or a
     flat ``{"key": "name"}`` object. Keys may be IPs, FQDNs or short names;
     lookups are case-insensitive for non-IP keys.
+
+    Both the documented ``{"endpoints": {...}}`` form and the legacy flat
+    ``{"key": {"name": "NAME", "aliases": [...]}}`` form are accepted, so a
+    case file written either way resolves to real display names rather than the
+    stringified dict.
     """
     if not path or not os.path.isfile(path):
         return {}
@@ -45,17 +70,16 @@ def load_map(path: str) -> dict[str, str]:
         return {}
     out: dict[str, str] = {}
     if isinstance(d, dict) and isinstance(d.get("endpoints"), dict):
-        for key, meta in d["endpoints"].items():
-            if isinstance(meta, dict):
-                name = str(meta.get("name") or key)
-                out[str(key)] = name
-                for a in meta.get("aliases") or []:
-                    out[str(a)] = name
-            else:
-                out[str(key)] = str(meta or key)
+        src = d["endpoints"]
     elif isinstance(d, dict):
-        for k, v in d.items():
-            out[str(k)] = str(v)
+        src = d
+    else:
+        return out
+    for key, meta in src.items():
+        name = _endpoint_name(meta) or str(key)
+        out[str(key)] = name
+        for a in _aliases_of(meta):
+            out[a] = name
     return out
 
 
@@ -118,12 +142,14 @@ def norm_host(value: str, hostmap: dict[str, str] | None = None) -> str:
 def load_map_from_obj(d) -> dict[str, str]:
     out: dict[str, str] = {}
     if isinstance(d, dict) and isinstance(d.get("endpoints"), dict):
-        for key, meta in d["endpoints"].items():
-            if isinstance(meta, dict):
-                name = str(meta.get("name") or key)
-                out[str(key)] = name
-                for a in meta.get("aliases") or []:
-                    out[str(a)] = name
-            else:
-                out[str(key)] = str(meta or key)
+        src = d["endpoints"]
+    elif isinstance(d, dict):
+        src = d
+    else:
+        return out
+    for key, meta in src.items():
+        name = _endpoint_name(meta) or str(key)
+        out[str(key)] = name
+        for a in _aliases_of(meta):
+            out[a] = name
     return out

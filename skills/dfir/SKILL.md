@@ -33,20 +33,34 @@ Use `docker/dfir.sh` (see workspace `CLAUDE.md`). Image: `dfir-toolkit`.
   `/opt/yara-rules/{signature-base,yara-rules}`; helpers `docker/av_triage.py`,
   `docker/av_parse.py`
 - Coverage manifest: `/opt/forensic-artifacts` (ForensicArtifacts YAML catalog)
-- Helpers: `docker/evtx_flatten.py` (EVTX JSONL → TSV timeline),
+- Helpers: `docker/evtx_flatten.py` (EVTX JSONL → TSV timeline; `data` values
+  are pipe-escaped — decode with its `split_data`, never hand-split on `" | "`),
   `docker/evtx_query.py` (filtered fact extraction from a flattened EVTX TSV),
   `docker/mft_query.py` (query MFTECmd `$MFT` / `$J`-USN CSV),
   `docker/pcap_objects.py` (carve + hash protocol objects from a PCAP),
-  `docker/ioc_export.py` (structured IOC JSON/YAML → flat CSV),
+  `docker/ioc_export.py` (structured IOC JSON/YAML → flat CSV; `--validate`),
+  `docker/ioc_collect.py` (artifacts → defanged IOC draft),
+  `docker/ioc_schema.py` (shared IOC types / defang / validation),
+  `docker/hostmap.py` (generic host-label normalisation shared by the timeline
+  and visualisation helpers; never truncates an IP, buckets link-local noise),
+  `docker/merge_timeline.py` (parsed artifacts → normalized timeline CSV),
   `docker/incident_viz.py` (IOC/timeline/Zeek → interactive HTML + static SVG/PNG),
   `docker/incident_dashboard.py` (IOC/timeline/Zeek/4688 → one filterable,
-  per-endpoint dashboard HTML)
+  per-endpoint dashboard HTML), `docker/custody.py` (chain-of-custody
+  hash/verify), and `docker/selftest.sh` (toolkit self-tests vs. fixtures).
 
 ## Standard workflow
-1. **Inventory & hash**
+1. **Inventory & hash** (chain of custody — hash before, verify after)
    ```sh
-   docker/dfir.sh bash -lc 'cd /data/evidences && find . -type f -exec sha256sum {} \; | sort -k2 > /data/analysis/hashes_evidence.sha256'
+   docker/dfir.sh python3 /data/tools/custody.py hash \
+     --label intake /data/evidences          # baseline -> analysis/hashes/intake.sha256
+   # ... analysis ...
+   docker/dfir.sh python3 /data/tools/custody.py verify \
+     --label intake --report /data/analysis/hashes/verify.json /data/evidences
+   # exit 0 = all digests unchanged; 1 = evidence changed/added/removed
    ```
+   The manifest is standard `sha256sum` output; `--exclude REGEX` skips carved
+   or scratch paths, `--quiet` prints only the summary.
 2. **Normalize EVTX → JSONL → TSV**
    ```sh
    docker/dfir.sh evtx_dump_rs -o jsonl <in.evtx> > /data/analysis/<host>/evtx/<name>.jsonl
@@ -58,7 +72,7 @@ Use `docker/dfir.sh` (see workspace `CLAUDE.md`). Image: `dfir-toolkit`.
 3. **Sigma triage** with Hayabusa (fast first pass):
    ```sh
    docker/dfir.sh bash -lc 'cd /opt/hayabusa && ./hayabusa-4.1.0-lin-x64-gnu \
-     dfir-timeline -d /data/evidences/<HOST>/C/Windows/System32/Logs \
+     dfir-timeline -d /data/evidences/<HOST>/C/Windows/System32/winevt/Logs \
      -o /data/analysis/<HOST>/hayabusa_timeline.csv -w -q -N -C -s -U'
    ```
 4. **MFT** parse: `MFTECmd -f '.../$MFT' --csv out/` (and `$Extend/$J` for USN).
@@ -78,16 +92,44 @@ Use `docker/dfir.sh` (see workspace `CLAUDE.md`). Image: `dfir-toolkit`.
 10. **ESXi / VMware** (see below).
 11. **Correlate**: every finding is confirmed by a second artefact
     (process-create ↔ network connection ↔ file timestamp ↔ auth event).
-12. **Timeline** into `analysis/<host>/…`; **report** into `reports/`.
-13. **IOC export** — collect every observable into `analysis/iocs.json`
-    (schema below) and normalize to CSV:
+12. **Timeline** — consolidate the parsed artifacts into the normalized
+    `timeline.csv` that step 14/15 consume:
     ```sh
-    docker/dfir.sh python3 /data/tools/ioc_export.py \
+    docker/dfir.sh python3 /data/tools/merge_timeline.py \
+      --evtx-tsv /data/analysis/<HOST>/evtx/Security.tsv \
+      --mft-csv  /data/analysis/<HOST>/mft/<HOST>_MFT.csv \
+      --usn-csv  /data/analysis/<HOST>/mft/<HOST>_USN.csv \
+      --zeek     /data/analysis/network/zeek --zeek-conn \
+      --esxi-timeline /data/analysis/esxi/timeline.csv \
+      --ip-map   /data/analysis/ip_map.json \
+      --out /data/reports/viz/timeline.csv
+    ```
+    `--ip-map` is JSON mapping IP/FQDN/alias → display name (the `endpoints`
+    block of `analysis/iocs.json` works directly); keep it in `analysis/`, never
+    in `docker/`. Hosts are normalised through `docker/hostmap.py`: a literal IP
+    is never truncated, an FQDN becomes its first label, and link-local /
+    multicast / broadcast hosts become `Network` (dropped by default; keep with
+    `--keep-noise`). Columns `time_utc,host,actor,event,technique,evidence,tags`. The EVTX→event
+    map is curated (4624/4625/4688/4769/7045/1102/…); `--all-evtx` emits every
+    event. Keep it beside the report so the visuals/dashboard read one file.
+13. **IOC export** — collect every observable into `analysis/iocs.json`
+    (schema below) and normalize to CSV. Start from a draft if useful:
+    ```sh
+    # optional: propose a de-duplicated, defanged draft from artifacts
+    docker/dfir.sh python3 /data/tools/ioc_collect.py \
+      --evtx-tsv /data/analysis/<HOST>/evtx/Security.tsv \
+      --usn-csv  /data/analysis/<HOST>/mft/<HOST>_USN.csv \
+      --zeek     /data/analysis/network/zeek \
+      --host <HOST> --case "<case>" --out /data/analysis/iocs_draft.json
+    # then, on the reviewed analysis/iocs.json:
+    docker/dfir.sh python3 /data/tools/ioc_export.py --validate \
       --in /data/analysis/iocs.json --out /data/analysis/iocs.csv
     # threat-intel view (benign/internal observables removed):
     docker/dfir.sh python3 /data/tools/ioc_export.py \
       --in /data/analysis/iocs.json --out /data/analysis/iocs_threatintel.csv --exclude-benign
     ```
+    `ioc_collect.py` tags private/loopback IPs `internal,benign`; `--validate`
+    exits 1 on schema errors (bad type, missing value, duplicate, bad MITRE id).
 14. **Visualize** — render analyst-facing diagrams from the artifacts above.
     Visuals are **deliverables**, so they go beside the report in `reports/viz/`:
     ```sh
@@ -95,6 +137,7 @@ Use `docker/dfir.sh` (see workspace `CLAUDE.md`). Image: `dfir-toolkit`.
       --iocs /data/analysis/iocs.json \
       --from-markdown /data/reports/incident_timeline.md \
       --zeek /data/analysis/network/zeek \
+      --ip-map /data/analysis/ip_map.json \
       --out /data/reports/viz --formats html,svg,png
     ```
     Produces `attack_timeline.{html,svg,png}`, `actor_graph.{html,svg,png}`,
@@ -112,6 +155,7 @@ Use `docker/dfir.sh` (see workspace `CLAUDE.md`). Image: `dfir-toolkit`.
       --iocs /data/analysis/iocs.json \
       --timeline /data/reports/viz/timeline.csv \
       --zeek /data/analysis/network/zeek \
+      --ip-map /data/analysis/ip_map.json \
       --proc /data/analysis/<HOST>/evtx/Security.tsv \
       --proc-linux /data/analysis/<LINUX_HOST>/proctree/proctree.json \
       --out /data/reports --title "<case>"
@@ -172,8 +216,8 @@ Artifacts (ForensicArtifacts `esxi.yaml`): `hostd.log`, `vmkernel.log`,
   VM-escape CVEs (OpenSLP/427, CD-ROM, VMCI/vSock, Tools guest-ops, USB).
 - Mount datastore / VMDK read-only for file review:
   ```sh
-  docker/dfir.sh vmfs-fuse -o ro /data/evidences/datastore /mnt/vmfs
-  docker/dfir.sh qemu-nbd --read-only -c /dev/nbd0 /data/evidences/disk.vmdk
+  docker/dfir.sh --privileged-cap vmfs-fuse -o ro /data/evidences/datastore /mnt/vmfs
+  docker/dfir.sh --privileged-cap qemu-nbd --read-only -c /dev/nbd0 /data/evidences/disk.vmdk
   ```
 - Answer the ESXi ransomware question directly: check for `.esxiargs`/`.locked`
   files, `HOW_TO_RESTORE*` notes, and encrypted `.vmdk` on the datastore.
@@ -261,7 +305,9 @@ only if **all** hold:
 When you add one: verify it against a real artefact from the current case, add
 it to the toolchain lists (`skills/dfir`, `README.md`, `CLAUDE.md`) and to
 `reset_case.sh --scrub-refs`, then confirm it is **case-free** (grep for host
-names/IPs/dates). Prefer extending an existing helper over adding a
+names/IPs/dates). Add a case-free check (with a fixture under
+`docker/tests/fixtures/`) to `docker/tests/run_selftest.py` and run
+`docker/selftest.sh`. Prefer extending an existing helper over adding a
 near-duplicate. One-off, case-specific scripts stay in `notes/` (which
 `reset_case.sh` wipes, by design — `docker/` survives).
 
@@ -315,7 +361,8 @@ you install it.
 
 ## Normalized timeline schema
 
-`docker/incident_viz.py` consumes (and emits) a flat timeline CSV:
+`docker/incident_viz.py` consumes (and emits) a flat timeline CSV; produce it
+from the parsed artifacts with `docker/merge_timeline.py` (workflow step 12):
 
 ```
 time_utc,host,actor,event,technique,evidence,tags
@@ -324,7 +371,8 @@ time_utc,host,actor,event,technique,evidence,tags
 
 - `time_utc` — ISO-8601 UTC; `technique` — comma-separated MITRE IDs;
   `tags` — semicolon-separated (`payload`, `credential`, `exfil`, …).
-- Bootstrap it from an existing Markdown chain table with
+- Produce it with `merge_timeline.py` from EVTX/MFT/USN/Zeek/ESXi; or bootstrap
+  it from an existing Markdown chain table with
   `incident_viz.py --from-markdown <report.md>`; it writes `timeline.csv` next to
   the visuals. Tags/techniques are auto-derived from the event text when blank.
 
@@ -350,6 +398,11 @@ absent they fall back to the generic rules. Because `analysis/` is wiped by
 only: `skills/dfir/examples/signatures.example.json` (never loaded).
 
 ## Pitfalls
+- The flattened `data` column packs fields as `Name=Value | Name=Value` with
+  values escaped (`|` -> `\p`, `\t`/`\n` -> `\t`/`\n`). Use
+  `evtx_flatten.split_data` (as `evtx_query.py` and `incident_dashboard.py` do)
+  to decode; a `CommandLine` containing a literal `|` would otherwise corrupt
+  field boundaries.
 - `evtx_dump` (python-evtx) and the Rust `evtx_dump` collide — the image
   renames the Rust binary to `evtx_dump_rs`.
 - After a `wevtutil cl` (1102) the Security log starts at the clear time;

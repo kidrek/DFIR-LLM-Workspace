@@ -6,6 +6,13 @@ Usage: evtx_flatten.py <input.jsonl> [output.tsv]
 Columns: time_utc, record_id, event_id, level, provider, channel, computer,
          user_sid, process_id, thread_id, activity_id, data (Name=Value; ...)
 
+The ``data`` blob packs the event's fields into one TSV column as
+``Name=Value | Name=Value``. Values are **escaped** (``\\`` -> ``\\\\``,
+``|`` -> ``\\p``, tab/CR/LF -> ``\\t``/``\\r``/``\\n``) so a literal ``|``
+inside a value (common in ``CommandLine``) cannot be mistaken for a field
+separator. Use ``split_data``/``escape_value`` from this module to decode;
+do **not** hand-split on ``" | "``.
+
 Stdlib only. Handles the deeply nested `Event` structure produced by
 omerbenamram/evtx `-o jsonl` and tolerates missing fields.
 """
@@ -14,36 +21,86 @@ import sys
 import re
 from datetime import datetime, timezone
 
+# ---- data-blob codec (pipe-safe) -------------------------------------------- #
+# Escape table for values packed into the single ``data`` column. ``|`` becomes
+# ``\p`` so it can never be confused with the field separator `` | ``.
+_ESCAPE = {"\\": "\\\\", "|": "\\p", "\t": "\\t", "\r": "\\r", "\n": "\\n"}
+_UNESCAPE = {"\\": "\\", "p": "|", "t": "\t", "r": "\r", "n": "\n"}
+
+
+def escape_value(text):
+    """Escape a value (or field name) for safe packing into the data blob."""
+    return "".join(_ESCAPE.get(ch, ch) for ch in str(text))
+
+
+def unescape_value(text):
+    """Reverse :func:`escape_value`. Unknown escapes are left as-is."""
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            nxt = text[i + 1]
+            out.append(_UNESCAPE.get(nxt, nxt))
+            i += 2
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def join_data(pairs):
+    """Join ``(name, value)`` pairs into an escaped ``Name=Value | ...`` blob."""
+    return " | ".join(f"{escape_value(k)}={escape_value(v)}" for k, v in pairs)
+
+
+def split_data(blob):
+    """Parse a flattened data blob into an ordered dict (pipe-safe).
+
+    Empty field names are dropped, matching the legacy behaviour for bare
+    list items. This is the single canonical splitter: consumers must use it
+    instead of splitting on ``" | "`` themselves.
+    """
+    out = {}
+    for part in (blob or "").split(" | "):
+        if "=" not in part:
+            continue
+        k, _, v = part.partition("=")
+        k = unescape_value(k.strip())
+        if k:
+            out[k] = unescape_value(v)
+    return out
+
 
 def walk_data(ed):
-    """Return 'k=v; k=v' from EventData/UserData which may be list or dict."""
-    out = []
+    """Return an escaped ``Name=Value | ...`` blob from EventData/UserData."""
     if ed is None:
         return ""
     if isinstance(ed, list):
-        for item in ed:
-            out.append(str(item))
-        return " | ".join(out)
+        return " | ".join(escape_value(str(item)) for item in ed)
+
+    pairs = []
 
     def rec(node):
         if isinstance(node, dict):
             for k, v in node.items():
                 if k == "#attributes":
                     for ak, av in (v or {}).items():
-                        out.append(f"{ak}={av}")
+                        pairs.append((ak, av))
                     continue
                 if isinstance(v, (dict, list)):
                     rec(v)
                 else:
-                    out.append(f"{k}={v}")
+                    pairs.append((k, v))
         elif isinstance(node, list):
             for v in node:
                 rec(v)
         else:
-            out.append(str(node))
+            pairs.append(("", node))
 
     rec(ed)
-    return " | ".join(out)
+    return join_data(pairs)
 
 
 def attrs(node):
@@ -53,12 +110,31 @@ def attrs(node):
     return {}
 
 
-def get(evt, key):
-    v = evt.get(key)
+def scalar_text(v):
+    """Robustly extract a scalar's text from the several shapes evtx_dump uses.
+
+    Handles the plain scalar (``"EventID": 4688``), the attribute-only form
+    (``{"#attributes": {"value": 4688}}``), the mixed form
+    (``{"#attributes": {...}, "value": 4688}``), ``{"$": ...}``, and lists
+    (joined with ``", "``). Previously the attribute-only form was stripped to
+    ``{"value": 4688}`` and then re-read as attributes, yielding an empty
+    string.
+    """
+    if v is None:
+        return ""
     if isinstance(v, dict):
-        # leaf may hold attributes only
-        return v.get("#attributes") if set(v.keys()) <= {"#attributes"} else v
-    return v
+        for k in ("value", "$", "#text"):
+            if k in v and not isinstance(v[k], (dict, list)):
+                return str(v[k])
+        a = v.get("#attributes")
+        if isinstance(a, dict):
+            for k in ("value", "$", "#text"):
+                if k in a:
+                    return scalar_text(a[k])
+        return ""
+    if isinstance(v, (list, tuple)):
+        return ", ".join(scalar_text(x) for x in v)
+    return str(v)
 
 
 def main():
@@ -85,17 +161,15 @@ def main():
             evt = obj.get("Event", obj)
             sysd = evt.get("System", {}) or {}
             tc = attrs(sysd.get("TimeCreated") or {}).get("SystemTime", "")
-            evid = get(sysd, "EventID")
-            if isinstance(evid, dict):
-                evid = attrs(evid).get("value", "")
+            evid = scalar_text(sysd.get("EventID"))
             prov = ""
             p = sysd.get("Provider")
             if isinstance(p, dict):
                 prov = (p.get("#attributes") or {}).get("Name", "")
-            chan = get(sysd, "Channel") or ""
-            comp = get(sysd, "Computer") or ""
-            rid = get(sysd, "EventRecordID")
-            lvl = get(sysd, "Level")
+            chan = scalar_text(sysd.get("Channel"))
+            comp = scalar_text(sysd.get("Computer"))
+            rid = scalar_text(sysd.get("EventRecordID"))
+            lvl = scalar_text(sysd.get("Level"))
             sec = sysd.get("Security")
             usid = attrs(sec).get("UserID", "") if isinstance(sec, dict) else ""
             ex = attrs(sysd.get("Execution") or {})

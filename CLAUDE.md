@@ -105,11 +105,29 @@ loosen these.
   `/opt/yara-rules/{signature-base,yara-rules}`; helpers `docker/av_triage.py`
   (YARA/ClamAV) and `docker/av_parse.py` (Defender EVTX/log normalization).
 - **IOC export:** helper `docker/ioc_export.py` — normalizes a structured
-  `analysis/iocs.json`/`.yaml` observable list into `analysis/iocs.csv` (and a
-  `--exclude-benign` threat-intel view). See `skills/dfir` for the schema.
+  `analysis/iocs.json`/`.yaml` observable list into `analysis/iocs.csv` (plus a
+  `--exclude-benign` threat-intel view). `--validate` enforces the schema
+  (shared in `docker/ioc_schema.py`) and exit 1 on errors; duplicate
+  observables are dropped by default. Helper `docker/ioc_collect.py` drafts
+  `analysis/iocs_draft.json` from parsed artifacts. See `skills/dfir` for the
+  schema.
+- **Timeline consolidation:** helper `docker/merge_timeline.py` builds the
+  normalized `time_utc,host,actor,event,technique,evidence,tags` CSV from EVTX
+  TSV, MFTECmd `$MFT`/`$J` CSV and Zeek logs; it is the producer for the
+  `incident_viz.py` / `incident_dashboard.py` timeline. `--ip-map` names hosts
+  (IP/FQDN/alias → display name, e.g. the IOC `endpoints` block); host labels
+  are normalised by `docker/hostmap.py` (never truncates an IP, buckets
+  link-local/multicast/broadcast as `Network`, dropped by default).
 - **Queries:** `docker/evtx_query.py` (filtered extraction from a flattened
   EVTX TSV), `docker/mft_query.py` (query MFTECmd `$MFT`/`$J` CSV),
   `docker/pcap_objects.py` (carve + SHA-256-hash protocol objects from a PCAP).
+- **Chain of custody:** `docker/custody.py` — `hash` writes
+  `analysis/hashes/<label>.sha256` (+ JSON manifest); `verify` re-hashes and
+  exits non-zero on any change. Run via
+  `docker/dfir.sh python3 /data/tools/custody.py hash|verify …`.
+- **Self-test:** `docker/selftest.sh` runs `docker/tests/run_selftest.py`
+  against synthetic fixtures in `docker/tests/fixtures/` (no case evidence);
+  use it as a regression gate after changing a helper.
 - **Visualization:** helper `docker/incident_viz.py` — renders an attack
   timeline, actor/network graph and ATT&CK matrix from `analysis/iocs.json`, a
   normalized timeline CSV (or a Markdown chain table via `--from-markdown`) and
@@ -117,6 +135,11 @@ loosen these.
   `reports/viz/`): single-file offline HTML (JS inlined from `/opt/viz-assets`)
   plus optional static SVG/PNG (`matplotlib`/`networkx`).
 - **Utilities:** `jq`, `ripgrep`, `file`, `sha256sum`, `dfir-unfurl`.
+
+Python dependencies are version-pinned in `docker/constraints.txt` (reproducible
+builds); `.dockerignore` keeps the build context free of `__pycache__`, docs and
+the test fixtures. The wrapper sets `PYTHONDONTWRITEBYTECODE=1` so the mounted
+helpers are not recompiled on every run.
 
 `/opt/forensic-artifacts` holds the ForensicArtifacts catalog (YAML definitions
 of artifact *locations*). It is a **coverage manifest/checklist**, not a parser:
@@ -131,7 +154,12 @@ docker build -t dfir-toolkit docker/
 ```
 
 `docker/dfir.sh` is a thin wrapper that enforces the read-only, ephemeral,
-non-root discipline and maps the workspace into the container. Usage:
+non-root discipline and maps the workspace into the container. It also hardens
+the container by default: `--cap-drop=ALL`, `--security-opt=no-new-privileges`,
+a `noexec/nosuid/nodev` `/tmp` tmpfs, and pids/memory/cpu limits. Use
+`--privileged-cap` (adds `SYS_ADMIN` + `/dev/fuse`) only for the read-only
+VMFS/VMDK mounts, and `--no-hardening` as a last resort. Python deps are pinned
+in `docker/constraints.txt` for reproducible builds. Usage:
 
 ```sh
 # Generic: run a command with evidence + analysis mounted
@@ -157,8 +185,9 @@ docker/dfir.sh tshark -r /data/evidences/traffic.pcapng -Y tcp.port==445
 
 ## Workflow
 
-1. **Inventory & hash** — enumerate evidence, compute SHA-256 into
-   `analysis/hashes/`.
+1. **Inventory & hash** — enumerate evidence, hash SHA-256 into
+   `analysis/hashes/<label>.sha256` via `docker/custody.py hash`, then
+   `docker/custody.py verify` after analysis (exit 0 = unchanged).
 2. **Triage** — run Hayabusa/Chainsaw for a first-pass Sigma/ATT&CK timeline
    (Windows); use the ForensicArtifacts manifest to check artifact coverage.
 3. **Parse** — export per-source EVTX to JSON, `$MFT` to CSV, PCAP to Zeek

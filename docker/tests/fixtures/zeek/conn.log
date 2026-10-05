@@ -1,0 +1,4 @@
+#separator \x09
+#fields	ts	uid	id.orig_h	id.orig_p	id.resp_h	id.resp_p	proto	service	duration	orig_bytes	resp_bytes
+1704068100.000000	C1	10.0.0.5	4444	10.0.0.10	80	tcp	http	3.0	43	0
+1704068160.000000	C2	10.0.0.5	5555	10.0.0.20	445	tcp	smb	1.0	10	20

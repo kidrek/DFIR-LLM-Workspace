@@ -1,0 +1,13 @@
+# Build-context exclusions for the DFIR toolkit image.
+# Keep the build context tiny and free of case data / scratch.
+__pycache__/
+*.py[cod]
+.git/
+.gitignore
+*.md
+tests/
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*~

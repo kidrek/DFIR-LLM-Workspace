@@ -1,0 +1,3 @@
+#separator \x09
+#fields	ts	uid	id.orig_h	id.orig_p	id.resp_h	id.resp_p	method	host	uri
+1704068100.000000	C1	10.0.0.5	4444	10.0.0.10	80	GET	evil.local	/evil.exe

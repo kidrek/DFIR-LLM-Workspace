@@ -52,6 +52,10 @@ try:
     import dfir_signatures as siglib  # optional, per-case detection patterns
 except Exception:  # noqa: BLE001
     siglib = None
+try:
+    import hostmap as _hm  # generic host-label normalisation (case-free)
+except Exception:  # noqa: BLE001
+    _hm = None
 
 UTC = timezone.utc
 
@@ -343,11 +347,14 @@ def timeline_from_markdown(path: str, date: tuple[int, int, int]) -> list[dict]:
     return out
 
 
-def read_timeline_csv(path: str) -> list[dict]:
+def read_timeline_csv(path: str, hostmap: dict | None = None) -> list[dict]:
     rows = []
     with open(path, encoding="utf-8-sig", newline="") as fh:
         for r in csv.DictReader(fh):
             rows.append({c: (r.get(c) or "").strip() for c in TIMELINE_COLUMNS})
+    if hostmap is not None and _hm:
+        for r in rows:
+            r["host"] = _hm.norm_host(r.get("host", ""), hostmap)
     for r in rows:
         if not r["tags"]:
             r["tags"] = ";".join(scan_tags(" ".join([r["event"], r["evidence"]])))
@@ -477,8 +484,13 @@ def parse_zeek_dir(path: str):
 # --------------------------------------------------------------------------- #
 # graph build
 # --------------------------------------------------------------------------- #
-def build_graph(iocs: dict, zeek_edges: list[dict]) -> tuple[list[dict], list[dict]]:
+def build_graph(iocs: dict, zeek_edges: list[dict],
+                hostmap: dict | None = None) -> tuple[list[dict], list[dict]]:
     nodes: dict[str, dict] = {}
+    hm_map = hostmap or {}
+
+    def disp(v):
+        return hm_map.get(v, v)
 
     def add_node(nid, label, ntype, tags=None, title="", role=""):
         if nid in nodes:
@@ -513,7 +525,8 @@ def build_graph(iocs: dict, zeek_edges: list[dict]) -> tuple[list[dict], list[di
             f"first: {o.get('first_seen_utc','')}",
             f"tags: {';'.join(tags) if isinstance(tags, list) else tags}",
         ] if x.split(":", 1)[-1].strip())
-        add_node(nid, str(val)[:40], typ, tags, title, o.get("role", ""))
+        lbl = disp(str(val)[:40]) if typ == "ipv4" else str(val)[:40]
+        add_node(nid, lbl, typ, tags, title, o.get("role", ""))
 
     edges: list[dict] = []
     seen_edges: set[tuple] = set()
@@ -526,8 +539,8 @@ def build_graph(iocs: dict, zeek_edges: list[dict]) -> tuple[list[dict], list[di
 
     for e in zeek_edges:
         src, dst = e["from"], e["to"]
-        add_node(src, src, "ipv4", title="observed in Zeek")
-        add_node(dst, dst, "ipv4", title="observed in Zeek")
+        add_node(src, disp(src), "ipv4", title="observed in Zeek")
+        add_node(dst, disp(dst), "ipv4", title="observed in Zeek")
         lbl = e["label"] if e["count"] <= 1 else f"{e['label']} ×{e['count']}"
         add_edge(src, dst, lbl, width=min(1.0 + e["count"] * 0.15, 6.0))
 
@@ -836,6 +849,9 @@ def main(argv=None) -> int:
     ap.add_argument("--from-markdown", dest="from_md",
                     help="Markdown report with a consolidated chain table")
     ap.add_argument("--zeek", help="directory of Zeek *.log")
+    ap.add_argument("--ip-map", default="",
+                    help="JSON host map (IP/FQDN/alias -> display name); e.g. the "
+                         "endpoints block of analysis/iocs.json")
     ap.add_argument("--out", required=True, help="output directory")
     ap.add_argument("--title", default="Incident", help="case title")
     ap.add_argument("--date", default="", help="override date YYYY-MM-DD for bare times")
@@ -869,9 +885,16 @@ def main(argv=None) -> int:
     if isinstance(iocs, dict) and iocs.get("case") and args.title == "Incident":
         args.title = iocs["case"]
 
+    # host map (case inventory) for normalising labels
+    hostmap = {}
+    if _hm is not None:
+        hostmap = _hm.load_map(args.ip_map) if args.ip_map else {}
+        if not hostmap and isinstance(iocs, dict):
+            hostmap = _hm.load_map_from_obj(iocs)
+
     # timeline
     if args.timeline:
-        rows = read_timeline_csv(args.timeline)
+        rows = read_timeline_csv(args.timeline, hostmap)
     elif args.from_md:
         if not date_explicit:
             found = infer_date(args.from_md) or infer_date_from_iocs(obs)
@@ -893,7 +916,7 @@ def main(argv=None) -> int:
     zeek_edges = []
     if args.zeek and os.path.isdir(args.zeek):
         zeek_edges, _ = parse_zeek_dir(args.zeek)
-    nodes, edges = build_graph(iocs, zeek_edges)
+    nodes, edges = build_graph(iocs, zeek_edges, hostmap)
     if nodes:
         json.dump({"nodes": nodes, "edges": edges},
                   open(os.path.join(args.out, "graph.json"), "w"), indent=2, ensure_ascii=False)

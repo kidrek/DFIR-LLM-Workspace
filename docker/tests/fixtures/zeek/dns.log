@@ -1,0 +1,3 @@
+#separator \x09
+#fields	ts	uid	id.orig_h	id.orig_p	id.resp_h	id.resp_p	proto	trans_id	query
+1704068101.000000	C1	10.0.0.5	4444	10.0.0.10	53	udp	12345	evil.local

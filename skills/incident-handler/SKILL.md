@@ -23,11 +23,14 @@ evidence, or a timeline + IOCs + report must be produced.
   `docker/dfir.sh python3 /data/tools/<tool>.py`) so it survives `reset_case.sh`
   and is reusable next case. One-off, case-specific scripts stay in `notes/`.
   `docker/` must contain **zero case data** (see `docker/dfir_signatures.py`).
+  After changing a helper, run `docker/selftest.sh` (fixtures under
+  `docker/tests/fixtures/`) and extend it with a case-free check.
 
 ## Engagement flow
 1. **Intake** — read the task list (`evidences/Questions.md`), inventory hosts
    and evidence types.
-2. **Chain of custody** — hash all evidence (see dfir skill).
+2. **Chain of custody** — hash all evidence (`docker/custody.py hash`), then
+   `verify` after analysis and require exit 0 (see dfir skill).
 3. **Triage** — Sigma/Hayabusa per host; identify malicious vs. benign/IR
    activity (note forensic-tool runs by the responder too).
 4. **Root cause** — initial access, exploited service, first execution.

@@ -94,7 +94,9 @@ RUN set -eux; \
         curl -fsSL -o "/tmp/${tool}.zip" "https://download.ericzimmermanstools.com/net9/${tool}.zip"; \
         mkdir -p "/opt/zimmerman/${tool}"; \
         unzip -q "/tmp/${tool}.zip" -d "/opt/zimmerman/${tool}"; \
-        printf '#!/bin/sh\nexec dotnet /opt/zimmerman/%s/%s.dll "$@"\n' "${tool}" "${tool}" \
+        dll="$(find "/opt/zimmerman/${tool}" -type f -iname "${tool}.dll" | head -n1)"; \
+        test -n "$dll"; \
+        printf '#!/bin/sh\nexec dotnet "%s" "$@"\n' "$dll" \
             > "/usr/local/bin/${tool}"; \
         chmod +x "/usr/local/bin/${tool}"; \
         rm -f "/tmp/${tool}.zip"; \
@@ -107,7 +109,9 @@ RUN set -eux; \
 # volatility3        - memory forensics
 # yara-python        - pattern matching
 # dfir-unfurl        - browser/URL history
-RUN pip3 install --no-cache-dir --break-system-packages \
+# Versions are pinned via docker/constraints.txt for reproducible builds.
+COPY constraints.txt /tmp/constraints.txt
+RUN pip3 install --no-cache-dir --break-system-packages -c /tmp/constraints.txt \
         python-evtx \
         pandas \
         python-dateutil \
@@ -120,7 +124,7 @@ RUN pip3 install --no-cache-dir --break-system-packages \
 # ---- plaso (super-timeline engine; large install, kept as its own layer) ----
 # Plaso installs console scripts without the .py suffix; add the conventional
 # aliases so `log2timeline.py`/`psort.py` (as used in docs) also work.
-RUN pip3 install --no-cache-dir --break-system-packages plaso \
+RUN pip3 install --no-cache-dir --break-system-packages -c /tmp/constraints.txt plaso \
     && ln -sf /usr/local/bin/log2timeline /usr/local/bin/log2timeline.py \
     && ln -sf /usr/local/bin/psort /usr/local/bin/psort.py \
     && ln -sf /usr/local/bin/pinfo /usr/local/bin/pinfo.py
@@ -147,9 +151,12 @@ RUN git clone --depth 1 https://github.com/Neo23x0/signature-base.git \
 # ---- ClamAV signature database ----------------------------------------------
 # `clamscan` from the base layer has no signatures. Fetch the CVD database at
 # build time so the image is usable offline; refresh later with `freshclam`.
-# The clamd/clamav-daemon layer is not installed (only the CLI scanner is used).
+# Assert a database exists so a failed fetch fails the build instead of
+# silently producing a signature-less image. The clamd/clamav-daemon layer is
+# not installed (only the CLI scanner is used).
 RUN freshclam --quiet || true \
     && rm -rf /var/lib/clamav/*.sign \
+    && test -n "$(find /var/lib/clamav -name '*.cvd' -o -name '*.cld' 2>/dev/null)" \
     && ls -la /var/lib/clamav
 
 # ---- mac_apt (macOS plists, unified logs, FSEvents, SQLite artifacts) -------
@@ -163,12 +170,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && git clone --depth 1 https://github.com/ydkhatri/mac_apt.git /opt/mac_apt \
     && rm -rf /opt/mac_apt/.git \
-    && pip3 install --no-cache-dir --break-system-packages pybindgen==0.21.0 \
-    && pip3 install --no-cache-dir --break-system-packages --no-build-isolation \
+    && pip3 install --no-cache-dir --break-system-packages -c /tmp/constraints.txt pybindgen==0.21.0 \
+    && pip3 install --no-cache-dir --break-system-packages --no-build-isolation -c /tmp/constraints.txt \
         "fastchunking==0.0.3" \
     && cd /opt/mac_apt \
     && pip3 install --no-cache-dir --break-system-packages -r requirements.txt \
-    && pip3 install --no-cache-dir --break-system-packages --force-reinstall \
+    && pip3 install --no-cache-dir --break-system-packages -c /tmp/constraints.txt --force-reinstall \
         "pytsk3>=20260715" \
     && printf '#!/bin/sh\nexec python3 /opt/mac_apt/mac_apt.py "$@"\n' \
         > /usr/local/bin/mac_apt && chmod +x /usr/local/bin/mac_apt
@@ -180,7 +187,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends graphviz \
     && rm -rf /var/lib/apt/lists/* \
-    && pip3 install --no-cache-dir --break-system-packages matplotlib networkx
+    && pip3 install --no-cache-dir --break-system-packages -c /tmp/constraints.txt \
+        matplotlib networkx
 
 # Vendor the JS bundles so rendered HTML is single-file and fully offline.
 # The helper inlines these into each deliverable (no network, no CDN).
@@ -208,6 +216,18 @@ RUN git clone --depth 1 https://github.com/ForensicArtifacts/artifacts.git /opt/
 RUN printf '#!/bin/sh\n# usage: evtx2json <file.evtx> [out.jsonl]\nexec evtx_dump_rs -o jsonl "$@"\n' \
         > /usr/local/bin/evtx2json && chmod +x /usr/local/bin/evtx2json
 
+# ---- chain-of-custody helper ------------------------------------------------
+# hash/verify evidence (SHA-256). The script itself is mounted from docker/ at
+# /data/tools/; this creates a PATH entry for convenience.
+RUN printf '#!/bin/sh\nexec python3 /data/tools/custody.py "$@"\n' \
+        > /usr/local/bin/custody && chmod +x /usr/local/bin/custody
+
+# ---- timeline + IOC helpers -------------------------------------------------
+RUN printf '#!/bin/sh\nexec python3 /data/tools/merge_timeline.py "$@"\n' \
+        > /usr/local/bin/merge_timeline && chmod +x /usr/local/bin/merge_timeline \
+    && printf '#!/bin/sh\nexec python3 /data/tools/ioc_collect.py "$@"\n' \
+        > /usr/local/bin/ioc_collect && chmod +x /usr/local/bin/ioc_collect
+
 # ---- ESXi triage helper -----------------------------------------------------
 # Parse/hunt VMware ESXi support bundles. The script itself is mounted from
 # docker/ at /data/tools/; this creates a PATH entry for convenience.
@@ -221,5 +241,8 @@ RUN printf '#!/bin/sh\nexec python3 /data/tools/linux_proctree.py "$@"\n' \
         > /usr/local/bin/linux_proctree && chmod +x /usr/local/bin/linux_proctree
 
 # Output ownership: run as the caller's uid/gid (see docker/dfir.sh)
+# Avoid recompiling the mounted helpers on every invocation (they live on a
+# read-only mount, so .pyc cannot be written anyway).
+ENV PYTHONDONTWRITEBYTECODE=1
 WORKDIR /data
 CMD ["/bin/bash"]

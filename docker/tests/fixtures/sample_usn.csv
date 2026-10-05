@@ -1,0 +1,4 @@
+EntryNumber,Name,ParentPath,Extension,FileAttributes,IsDirectory,UpdateTimestamp,UpdateReasons
+7001,mimikatz.exe,.\Users\alice\Downloads,.exe,Archive,False,2026-01-01 00:16:45,FileCreate
+7002,notes.txt,.\Users\alice,.txt,Archive,False,2026-01-01 00:17:10,FileCreate,DataOverwrite
+7003,Windows,.\,,Directory,True,2026-01-01 00:10:00,FileCreate

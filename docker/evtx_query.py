@@ -46,8 +46,12 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from evtx_flatten import split_data  # canonical pipe-safe data-blob parser
 
 
 # Columns of evtx_flatten.py output.
@@ -55,6 +59,10 @@ BASE_COLS = [
     "time_utc", "record_id", "event_id", "level", "provider", "channel",
     "computer", "user_sid", "process_id", "thread_id", "activity_id", "data",
 ]
+
+# Identifier columns always emitted so every row is citable
+# (file + channel + record/event id + UTC time).
+ID_COLS = ["time_utc", "record_id", "event_id", "channel", "computer"]
 
 # Convenient default field sets per common Windows event ID. Only used when the
 # caller does not pass --fields.
@@ -80,21 +88,14 @@ DEFAULT_FIELDS = {
 def parse_data(blob: str) -> dict:
     """Split the flattened ``Name=Value | Name=Value`` blob into a dict.
 
-    Keys are matched case-insensitively on lookup. The original key casing is
-    preserved. Values keep whatever text evtx_flatten produced.
+    Delegates to :func:`evtx_flatten.split_data`, which un-escapes literal
+    ``|`` characters so a ``CommandLine`` containing pipes cannot corrupt the
+    field boundaries. Keys preserve their original casing; lookups are
+    case-insensitive via :func:`ci_get`.
     """
-    out: dict[str, str] = {}
     if not blob:
-        return out
-    for part in blob.split("|"):
-        part = part.strip()
-        if not part or "=" not in part:
-            continue
-        k, _, v = part.partition("=")
-        k = k.strip()
-        if k:
-            out[k] = v.strip()
-    return out
+        return {}
+    return split_data(blob)
 
 
 def ci_get(d: dict, name: str) -> str:
@@ -117,10 +118,8 @@ def resolve_fields(args, rows, parsed):
     extra = [f.strip() for f in (args.fields or "").split(",") if f.strip()]
     base = [c for c in BASE_COLS if c != "data"]
     if extra:
-        # Keep the record identifier columns plus the requested fields.
-        cols = []
-        for c in ("time_utc", "record_id", "event_id", "computer"):
-            cols.append(c)
+        # Keep the citable identifier columns plus the requested fields.
+        cols = list(ID_COLS)
         cols.extend(extra)
         return cols, extra
     # No --fields: use the per-EID default for a single-EID query, else 'data'.
@@ -129,7 +128,7 @@ def resolve_fields(args, rows, parsed):
         eid = next(iter(eids))
         chosen = DEFAULT_FIELDS.get(eid)
         if chosen:
-            return ["time_utc", "record_id", "event_id", "computer"] + chosen, chosen
+            return list(ID_COLS) + chosen, chosen
     return base + ["data"], None
 
 

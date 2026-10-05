@@ -148,7 +148,10 @@ if [[ "$SCRUB_REFS" -eq 1 ]]; then
   for f in "$WS/docker/ioc_export.py" "$WS/docker/incident_viz.py" \
            "$WS/docker/incident_dashboard.py" "$WS/docker/linux_proctree.py" \
            "$WS/docker/evtx_query.py" "$WS/docker/mft_query.py" \
-           "$WS/docker/pcap_objects.py" \
+           "$WS/docker/pcap_objects.py" "$WS/docker/custody.py" \
+           "$WS/docker/evtx_flatten.py" "$WS/docker/merge_timeline.py" \
+           "$WS/docker/ioc_collect.py" "$WS/docker/ioc_schema.py" \
+           "$WS/docker/hostmap.py" \
            "$WS/skills/dfir/SKILL.md" \
            "$WS"/skills/dfir/examples/*.json; do
     [[ -f "$f" ]] || continue

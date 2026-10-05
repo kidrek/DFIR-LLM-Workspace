@@ -46,8 +46,15 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 from collections import Counter
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import ioc_schema  # shared types / defang / validation
+except Exception:  # noqa: BLE001
+    ioc_schema = None
 
 COLUMNS = [
     "type", "value", "defanged", "role",
@@ -79,29 +86,10 @@ def as_tags(value) -> str:
     return "" if value is None else str(value)
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Export structured IOCs to CSV.")
-    ap.add_argument("--in", dest="inp", required=True, help="input JSON/YAML")
-    ap.add_argument("--out", dest="out", required=True, help="output CSV")
-    ap.add_argument("--exclude-benign", action="store_true",
-                    help="drop observables tagged 'benign'")
-    ap.add_argument("--exclude-tag", action="append", default=[],
-                    help="drop observables carrying this tag (repeatable)")
-    args = ap.parse_args(argv)
-
-    data = load(args.inp)
-    if isinstance(data, list):
-        observables = data
-    elif isinstance(data, dict):
-        observables = data.get("observables", [])
-    else:
-        sys.exit("ERROR: input must be an object with 'observables' or a list")
-
-    drop_tags = set(args.exclude_tag)
-    if args.exclude_benign:
-        drop_tags.add("benign")
-
+def _prepare(observables, drop_tags, dedupe):
+    """Filter/dedupe/enrich observables into CSV-ready rows."""
     rows = []
+    seen = set()
     for item in observables:
         if not isinstance(item, dict):
             continue
@@ -111,8 +99,61 @@ def main(argv=None) -> int:
             continue
         row = {c: item.get(c, "") for c in COLUMNS}
         row["tags"] = tags
-        rows.append({c: ("" if row[c] is None else row[c]) for c in COLUMNS})
+        # Fill a missing defanged rendering from the type.
+        if ioc_schema is not None and not row.get("defanged"):
+            row["defanged"] = ioc_schema.defang(row.get("value", ""),
+                                                str(row.get("type", "")))
+        row = {c: ("" if row[c] is None else row[c]) for c in COLUMNS}
+        if dedupe and ioc_schema is not None:
+            key = (row["type"], ioc_schema.normalize(row["type"], row["value"]))
+            if key in seen:
+                continue
+            seen.add(key)
+        rows.append(row)
+    return rows
 
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="Export structured IOCs to CSV.")
+    ap.add_argument("--in", dest="inp", required=True, help="input JSON/YAML")
+    ap.add_argument("--out", dest="out", required=True, help="output CSV")
+    ap.add_argument("--exclude-benign", action="store_true",
+                    help="drop observables tagged 'benign'")
+    ap.add_argument("--exclude-tag", action="append", default=[],
+                    help="drop observables carrying this tag (repeatable)")
+    ap.add_argument("--validate", action="store_true",
+                    help="validate the schema and exit 1 on any error")
+    ap.add_argument("--no-dedupe", dest="dedupe", action="store_false",
+                    help="keep duplicate (type,value) observables")
+    args = ap.parse_args(argv)
+
+    data = load(args.inp)
+    if isinstance(data, list):
+        doc = {"observables": data}
+    elif isinstance(data, dict):
+        doc = data
+    else:
+        sys.exit("ERROR: input must be an object with 'observables' or a list")
+
+    # Schema validation (shared with ioc_collect.py).
+    errors = ioc_schema.validate(doc) if ioc_schema is not None else []
+    if errors:
+        if args.validate:
+            print(f"ioc_export: {len(errors)} schema error(s) in {args.inp}:",
+                  file=sys.stderr)
+            for e in errors:
+                print(f"  - {e}", file=sys.stderr)
+            return 1
+        print(f"ioc_export: WARNING {len(errors)} schema issue(s); "
+              f"run with --validate for details", file=sys.stderr)
+
+    observables = doc.get("observables", [])
+
+    drop_tags = set(args.exclude_tag)
+    if args.exclude_benign:
+        drop_tags.add("benign")
+
+    rows = _prepare(observables, drop_tags, args.dedupe)
     rows.sort(key=lambda r: (str(r["type"]), str(r["value"])))
 
     with open(args.out, "w", newline="", encoding="utf-8") as fh:

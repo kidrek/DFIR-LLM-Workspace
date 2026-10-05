@@ -49,10 +49,10 @@ rm -rf .git && git init
 # 3. Drop evidence into evidences/ (keep original archives intact)
 #    and put the case task list at evidences/Questions.md if you have one.
 
-# 4. Inventory & hash evidence (chain of custody)
-docker/dfir.sh bash -lc \
-  'cd /data/evidences && find . -type f -exec sha256sum {} \; | sort -k2 \
-   > /data/analysis/hashes_evidence.sha256'
+# 4. Inventory & hash evidence (chain of custody). import-of-record is the
+#    baseline; re-run 'verify' after analysis and require exit 0.
+docker/dfir.sh python3 /data/tools/custody.py hash \
+  --label intake /data/evidences
 
 # 5. Run a tool
 docker/dfir.sh hayabusa dfir-timeline \
@@ -88,16 +88,27 @@ applies. `/reset-case --keep-evidence` passes flags through.
 ## Wrapper usage
 
 `docker/dfir.sh` enforces read-only evidence, ephemeral (`--rm`) containers,
-non-root execution, and no network by default.
+non-root execution, no network by default, and a hardened container (all Linux
+capabilities dropped, `no-new-privileges`, a `noexec/nosuid/nodev` `/tmp` tmpfs,
+and pids/memory/cpu limits).
 
 ```sh
-docker/dfir.sh [--net] [--image IMG] [--shell] <command> [args...]
+docker/dfir.sh [--net] [--image IMG] [--shell] [--privileged-cap] \
+               [--no-hardening] <command> [args...]
 ```
+
+- `--privileged-cap` adds `SYS_ADMIN` + `/dev/fuse` + `apparmor:unconfined`;
+  needed only for the read-only VMFS/VMDK mounts (`vmfs-fuse`, `qemu-nbd`).
+- `--no-hardening` disables the hardening flags (last resort).
+- Limits default to 4 GB / 4 CPUs and a 2 GB `/tmp`; override with
+  `DFIR_MEM` / `DFIR_CPUS` / `DFIR_TMP_SIZE`.
+
+Build reproducibility: Python packages are pinned in `docker/constraints.txt`.
 
 Mounts:
 
 - `/data/evidences` -> `evidences/` (read-only)
-- `/data/analysis`  -> `analysis/` (read-write)
+- `/data/analysis`  -> `analysis/` (read-write, also `/data/out`)
 - `/data/reports`   -> `reports/`  (read-write)
 - `/data/notes`     -> `notes/`    (read-write)
 - `/data/tools`     -> `docker/`   (read-only)
@@ -124,17 +135,43 @@ Mounts:
   `Yara-Rules` rule sets under `/opt/yara-rules`, plus the helpers
   `docker/av_triage.py` (YARA/ClamAV scanning) and `docker/av_parse.py`
   (Defender EVTX/text-log normalization).
-- **IOC export:** `docker/ioc_export.py` turns a structured `analysis/iocs.json`
-  (or `.yaml`) observable list into a flat `analysis/iocs.csv` for SIEM/CTI
-  ingestion; `--exclude-benign` yields a threat-intel-only view. The optional
-  `endpoints` block names hosts and sets dashboard ordering. Schema in
-  `skills/dfir`; reference example (never loaded) in
+- **IOC export & schema:** `docker/ioc_export.py` turns a structured
+  `analysis/iocs.json` (or `.yaml`) observable list into a flat
+  `analysis/iocs.csv` for SIEM/CTI ingestion; `--exclude-benign` yields a
+  threat-intel-only view, `--validate` enforces the schema (exit 1 on errors),
+  and duplicate `(type,value)` observables are dropped by default. The shared
+  schema (`docker/ioc_schema.py`) defines the allowed types, defanging and
+  validation. The optional `endpoints` block names hosts and sets dashboard
+  ordering. Schema in `skills/dfir`; reference example (never loaded) in
   `skills/dfir/examples/iocs.example.json`.
+- **IOC drafting:** `docker/ioc_collect.py` scans the parsed artifacts (EVTX
+  TSV, `$MFT`/`$J` CSV, Zeek) and proposes a de-duplicated, defanged
+  `analysis/iocs_draft.json` — review, enrich, then save as `analysis/iocs.json`.
+  Internal/private IPs are tagged `internal,benign` by default.
+- **Timeline consolidation:** `docker/merge_timeline.py` folds parsed artifacts
+  into the normalized `time_utc,host,actor,event,technique,evidence,tags` CSV
+  consumed by `incident_viz.py` / `incident_dashboard.py` — an EVTX→EID map
+  (4624/4688/4769/7045/1102/…), file events from `$MFT`/`$J`, and Zeek
+  `http`/`dns`/`smb_mapping`/`kerberos` (+ optional `conn`) events, each with a
+  MITRE technique and a source citation. `--all-evtx` emits every event.
+  `--ip-map` maps IP/FQDN/alias → display name (the IOC `endpoints` block works
+  directly); host labels are normalised via `docker/hostmap.py` — an IP is never
+  truncated, an FQDN becomes its first label, and link-local/multicast/broadcast
+  hosts become `Network` (dropped by default). `incident_viz.py` and
+  `incident_dashboard.py` accept the same `--ip-map`.
 - **Artifact queries:** three case-free helpers speed up fact extraction —
   `docker/evtx_query.py` (filter a flattened EVTX TSV by EID/time/field/regex),
   `docker/mft_query.py` (query MFTECmd `$MFT` **or** `$J`/USN CSV by
   name/extension/time/reason), and `docker/pcap_objects.py` (carve protocol
   objects from a PCAP with `tshark` and emit a SHA-256 manifest).
+- **Chain of custody:** `docker/custody.py` hashes every evidence file into
+  `analysis/hashes/<label>.sha256` (plus a JSON manifest) and `verify`
+  re-hashes and compares, exiting non-zero on any change — so "hash before and
+  after" is two commands instead of manual shell. Run it via
+  `docker/dfir.sh python3 /data/tools/custody.py hash|verify …`.
+- **Toolkit self-test:** `docker/selftest.sh` runs `docker/tests/run_selftest.py`
+  against synthetic fixtures in `docker/tests/fixtures/` (no case evidence) —
+  a regression gate after changing a helper.
 - **Case signatures:** the tools contain **no case-specific patterns**. Any
   engagement-specific detection pattern (random dropper names, responder
   tooling, actor aliases) goes in an optional `analysis/signatures.json`,
@@ -235,8 +272,8 @@ Exit code `1` if any `HIGH`/`CRITICAL` finding exists. Detection content:
 Mount VMFS datastores / VMDKs read-only for file-level review:
 
 ```sh
-docker/dfir.sh vmfs-fuse -o ro /data/evidences/datastore /mnt/vmfs   # 5.x/6.x
-docker/dfir.sh qemu-nbd --read-only -c /dev/nbd0 /data/evidences/disk.vmdk
+docker/dfir.sh --privileged-cap vmfs-fuse -o ro /data/evidences/datastore /mnt/vmfs   # 5.x/6.x
+docker/dfir.sh --privileged-cap qemu-nbd --read-only -c /dev/nbd0 /data/evidences/disk.vmdk
 ```
 
 > ESXi logs are text, so plaso's generic `syslog` parser does not understand
@@ -325,11 +362,20 @@ global view.
 docker/dfir.sh python3 /data/tools/incident_dashboard.py \
   --iocs     /data/analysis/iocs.json \
   --timeline /data/analysis/timeline.csv \
+  --attack-timeline /data/analysis/attack_timeline.csv \
   --zeek     /data/analysis/network/zeek \
   --proc     /data/analysis/<HOST>/evtx/Security.tsv \
   --proc     /data/analysis/<HOST2>/evtx/Security.tsv \
   --out      /data/reports --title "Incident report"
 ```
+
+`--attack-timeline` is the **curated attack-chain** CSV (same
+`time_utc,host,actor,event,technique,evidence,tags` schema). When supplied (or
+when `analysis/attack_timeline.csv` exists) the timeline opens on **only those
+suspect/malicious events**; the full `--timeline` stays available behind the
+`all events` selector. With no curated file the timeline falls back to the full
+set. Observe/derive rules still apply (`Rec=`/`EID=` anchors + distinctive
+values), and `first/last seen` are back-filled from cited evidence.
 
 Outputs `reports/dashboard.html`, ``reports/report.html`` and
 `reports/dashboard_data.json` (the embedded payload, for reuse). `--layout`
@@ -366,6 +412,19 @@ Two complementary all-in-one layouts are produced from the same data:
   `proctree.html`.
 - Panels: **Overview**, **Timeline**, **Actor graph**, **Process trees**,
   **Observables** (all, incl. benign), **IOCs** (benign removed), **ATT&CK**.
+- **Timeline scoped to the attack chain** — the timeline opens on the **curated
+  attack chain** (`attack chain` mode, from `--attack-timeline`) and can be
+  switched to `all events`. Identical rows can be collapsed (`×N`) or shown
+  individually (`rows` selector). The panel has a **bounded height with vertical
+  scrolling** (the time axis stays pinned at the top and bottom); `−`/`+` zoom
+  (clamped to the displayed rows so timestamps never leave the incident window),
+  `Ctrl+wheel` zooms, `⟲ recenter` fits the displayed events, `⛶ full screen`
+  expands it. The `Timeline events` stat follows the active mode.
+- **First/last seen** — an observable with no `first_seen_utc` is back-filled at
+  build time from cited evidence (an ISO timestamp in `source`/`context`, else
+  the timeline row carrying its `Rec=`, else the earliest linked event). Derived
+  values are marked `*` in the table (hover shows the reference); nothing is
+  guessed when no evidence supports it.
 
 
 ## Guided analysis (Incident Handler agent)

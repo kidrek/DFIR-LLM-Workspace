@@ -55,6 +55,23 @@ try:
     import dfir_signatures as siglib  # optional, per-case detection patterns
 except Exception:  # noqa: BLE001
     siglib = None
+try:
+    import evtx_flatten as flat  # canonical pipe-safe data-blob parser
+except Exception:  # noqa: BLE001
+    flat = None
+try:
+    import hostmap as hm  # generic host-label normalisation (case-free)
+except Exception:  # noqa: BLE001
+    hm = None
+
+# Case host map (IP/FQDN/alias -> display name); populated in main().
+_HOST_MAP: dict[str, str] = {}
+
+
+def set_host_map(path: str = "") -> None:
+    """Populate the module host map from a JSON map (endpoints / ip-map)."""
+    global _HOST_MAP
+    _HOST_MAP = hm.load_map(path) if (hm and path) else {}
 
 # local fallbacks if incident_viz is missing ---------------------------------- #
 TACTIC_ORDER = getattr(viz, "TACTIC_ORDER", [
@@ -288,12 +305,15 @@ IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 def norm_host(v: str) -> str:
     """Normalise a host label to a short endpoint name.
 
-    Generic only: trim and reduce a FQDN to its first label. Endpoint display
-    names are supplied per case via the ``endpoints`` block of analysis/iocs.json
-    (see ``read_endpoints``); nothing case-specific is hardcoded here.
+    Delegates to ``hostmap.norm_host`` (generic, case-free): a literal IP is
+    never truncated, link-local/multicast/broadcast becomes ``Network``, and an
+    FQDN is reduced to its first label. Endpoint display names are supplied per
+    case via the ``endpoints`` block of analysis/iocs.json (see
+    ``read_endpoints``); nothing case-specific is hardcoded here.
     """
+    if hm is not None:
+        return hm.norm_host(v, _HOST_MAP)
     v = (v or "").strip()
-    v = v.split(".")[0] if re.match(r"^[A-Za-z0-9-]+\.", v) else v
     return v or "Unknown"
 
 
@@ -424,6 +444,13 @@ INTERESTING = INTERESTING_BASE
 
 
 def _parse_kv(data: str) -> dict:
+    """Parse a flattened EVTX data blob into a dict (pipe-safe).
+
+    Reuses evtx_flatten.split_data so literal ``|`` inside values (e.g. a
+    CommandLine pipeline) cannot shift field boundaries.
+    """
+    if flat is not None:
+        return flat.split_data(data)
     out = {}
     for part in (data or "").split(" | "):
         if "=" in part:
@@ -722,11 +749,166 @@ def read_linux_tree(path: str) -> tuple[str, list[dict]]:
 
 
 # --------------------------------------------------------------------------- #
+# timeline <-> observable correlation + observable "first seen" derivation
+# --------------------------------------------------------------------------- #
+# Observed-only view of the timeline: which rows are tied to an observable.
+# Matching is deliberately exact (source Rec=/EID= anchors, record references,
+# IP/hash/unique-file-name/account tokens); a generic token like a Windows
+# service account or a log channel name must NOT pull in every routine event.
+LINK_STOPWORDS = {
+    "security", "system", "application", "setup", "sam", "server", "admin",
+    "administrator", "cmd", "net", "windows", "system32", "powershell",
+    "ntds", "mssqlserver", "service", "services", "update", "default",
+    "kernel", "driver", "microsoft", "local", "network", "user", "guest",
+}
+_REF_RE = re.compile(
+    r"(?P<channel>[A-Za-z][A-Za-z0-9 _-]*?)\s+EID=(?P<eid>\d+)"
+    r"(?:\s+Rec=(?P<rec>\d+))?")
+_ISO_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z?")
+_DATE_TIME_RE = re.compile(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})")
+_REC_IN_EVIDENCE_RE = re.compile(r"\bRec=(\d+)\b")
+_EID_IN_EVIDENCE_RE = re.compile(r"\bEID=(\d+)\b")
+_WORD_RE = re.compile(r"[a-z0-9_.$@\\/:.-]+")
+
+
+def observable_refs(o: dict) -> set[tuple[str, str, str]]:
+    """(channel, eid, rec) triples parsed from an observable's ``source``."""
+    return {(m.group("channel").strip().lower(), m.group("eid"),
+             m.group("rec")) for m in _REF_RE.finditer(o.get("source") or "")}
+
+
+def observable_tokens(o: dict) -> set[str]:
+    """Distinctive, matchable strings carried by an observable value.
+
+    Only values that are (near-)unique to the attacker activity are kept --
+    IPv4, hostnames, hashes, full file paths/URLs, registry keys, shares and
+    account names. Generic Windows names are dropped.
+    """
+    typ = o.get("type")
+    val = (o.get("value") or "").strip()
+    toks: set[str] = set()
+    if typ in ("ipv4", "hostname", "file-hash"):
+        toks.add(val.lower())
+    elif typ == "account":
+        toks.add(val.lower())
+    elif typ == "file-path":
+        toks.add(val.lower())
+        toks.add(val.rsplit("\\", 1)[-1].lower())
+    elif typ == "url":
+        toks.add(val.lower())
+        toks.add(val.rstrip("/").rsplit("/", 1)[-1].lower())
+    elif typ == "registry":
+        toks.add(val.lower())
+        toks.add(val.rsplit("\\", 1)[-1].lower())
+    elif typ == "share":
+        toks.add(val.lower())
+    return {t for t in toks if len(t) >= 3 and t not in LINK_STOPWORDS}
+
+
+def link_timeline(timeline: list[dict], obs: list[dict]) -> None:
+    """Annotate every timeline row with the observables it is tied to.
+
+    Adds ``row["observables"]`` (sorted list of observable values); this drives
+    the observed-only timeline filter, the tooltip and the derived first-seen.
+    The ``actor`` field is intentionally NOT matched: a compromised account
+    (e.g. the SQL Server service account) appears as the actor on hundreds of
+    routine events and would otherwise swamp the signal.
+    """
+    rec_idx: dict[str, list[dict]] = defaultdict(list)
+    eid_idx: dict[str, list[dict]] = defaultdict(list)
+    tok_idx: dict[str, list[dict]] = defaultdict(list)
+    for o in obs:
+        for _ch, eid, rec in observable_refs(o):
+            if rec:
+                rec_idx[rec].append(o)
+        if o.get("type") == "event-id":
+            for n in re.findall(r"\d{3,4}", o.get("value") or ""):
+                eid_idx[n].append(o)
+        for tok in observable_tokens(o):
+            tok_idx[tok].append(o)
+
+    for r in timeline:
+        ev = r.get("evidence") or ""
+        hits: set[str] = set()
+        for m in _REC_IN_EVIDENCE_RE.findall(ev):
+            for o in rec_idx.get(m, []):
+                hits.add(o["value"])
+        for m in _EID_IN_EVIDENCE_RE.findall(ev):
+            for o in eid_idx.get(m, []):
+                hits.add(o["value"])
+        blob = ((r.get("event") or "") + " " + ev).lower()
+        for w in set(_WORD_RE.findall(blob)):
+            for o in tok_idx.get(w, []):
+                hits.add(o["value"])
+        r["observables"] = sorted(hits)
+
+
+def derive_first_seen(o: dict, timeline: list[dict]) -> tuple[str, str]:
+    """Best-effort (ISO-UTC timestamp, citation) for an observable with none.
+
+    Order of evidence, most direct first:
+      1. an explicit ISO date/time in the observable's own source/context;
+      2. the timeline row carrying the observed ``Rec=`` reference;
+      3. the earliest timeline row linked to the observable value.
+    Returns ("", "") when nothing can be substantiated -- never invents a date.
+    """
+    text = (o.get("source") or "") + " " + (o.get("context") or "")
+    m = _ISO_RE.search(text)
+    if m:
+        ts = m.group(0)
+        return (ts if ts.endswith("Z") else ts + "Z"), "source"
+    m = _DATE_TIME_RE.search(text)
+    if m:
+        return m.group(1) + "T" + m.group(2) + "Z", "source"
+
+    recs = [rec for _ch, _eid, rec in observable_refs(o) if rec]
+    best, ref = "", ""
+    for r in timeline:
+        ev = r.get("evidence") or ""
+        ts = r.get("time_utc") or ""
+        if not ts:
+            continue
+        for rec in recs:
+            if re.search(r"\bRec=%s\b" % re.escape(rec), ev) and \
+                    (not best or ts < best):
+                best, ref = ts, "Rec=" + rec
+    if best:
+        return best, ref
+
+    for r in timeline:
+        if o.get("value") in (r.get("observables") or []):
+            ts = r.get("time_utc") or ""
+            if ts and (not best or ts < best):
+                best, ref = ts, "timeline"
+    return best, ref
+
+
+def backfill_first_seen(obs: list[dict], timeline: list[dict]) -> int:
+    """Fill missing ``first_seen_utc`` from cited evidence; mark as derived.
+
+    Never overwrites an analyst-supplied value. Derived values get
+    ``first_seen_derived=True`` and ``first_seen_ref`` so the UI can show them
+    as inferred rather than observed.
+    """
+    n = 0
+    for o in obs:
+        if o.get("first_seen_utc"):
+            continue
+        ts, ref = derive_first_seen(o, timeline)
+        if ts:
+            o["first_seen_utc"] = ts
+            o["first_seen_derived"] = True
+            o["first_seen_ref"] = ref
+            n += 1
+    return n
+
+
+# --------------------------------------------------------------------------- #
 # graph with host attribution
 # --------------------------------------------------------------------------- #
 def build_graph(iocs: dict, zeek_edges: list[dict], ipmap: dict[str, str]):
     if viz is not None:
-        nodes, edges = viz.build_graph(iocs, zeek_edges)
+        nodes, edges = viz.build_graph(iocs, zeek_edges, ipmap)
     else:  # minimal fallback
         nodes, edges = [], []
         for o in iocs["observables"]:
@@ -801,6 +983,16 @@ section.panel{display:none;background:#161b22;border:1px solid var(--line);
   border-radius:0 8px 8px 8px;padding:16px}
 section.panel.active{display:block}
 #container{width:100%;height:60vh;min-height:420px}
+section.panel.tl-full{position:fixed;inset:0;z-index:200;margin:0;border-radius:0;
+  display:flex;flex-direction:column;background:var(--bg)}
+section.panel.tl-full #container{flex:1 1 auto;height:auto;min-height:0}
+.tl-tools{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 10px}
+.tl-tools .grow{flex:1 1 auto}
+.tl-tools select{background:#0d1117;border:1px solid var(--line);color:var(--fg);
+  border-radius:6px;padding:5px 8px;font-size:12px}
+.tl-tools button{background:#161b22;border:1px solid var(--line);color:var(--fg);
+  border-radius:6px;padding:5px 12px;cursor:pointer;font-size:12px}
+.tl-tools button:hover{border-color:var(--acc)}
 .hint{color:var(--mut);font-size:12px;margin:0 0 10px}
 table{border-collapse:collapse;width:100%;font-size:12px}
 .tablewrap{width:100%;overflow-x:auto}
@@ -892,8 +1084,29 @@ a{color:var(--acc)}
     <div id="overviewCards"></div>
   </section>
   <section class="panel" id="p-timeline">
-    <p class="hint">Attack timeline (UTC). Hover an item for its source record.
-      Rows are scoped to the selected endpoint.</p>
+    <p class="hint">Attack timeline (UTC). Shows only the curated attack chain
+      (suspect/malicious events) by default; switch the mode to see all events.
+      Hover an item for its source record; scroll vertically to navigate,
+      Ctrl+wheel or −/+ to zoom.</p>
+    <div class="tl-tools">
+      <label class="switch">show
+        <select id="tlMode">
+          <option value="attack" selected>attack chain</option>
+          <option value="all">all events</option>
+        </select>
+      </label>
+      <label class="switch">rows
+        <select id="tlGroup">
+          <option value="collapse" selected>collapse identical</option>
+          <option value="none">every row</option>
+        </select>
+      </label>
+      <span class="grow"></span>
+      <button id="tlOut" title="Zoom out (keep the time axis in view)">−</button>
+      <button id="tlIn" title="Zoom in">+</button>
+      <button id="tlFit" title="Recenter / reset zoom on the displayed events">⟲ recenter</button>
+      <button id="tlFull" title="Toggle full screen">⛶ full screen</button>
+    </div>
     <div id="container" style="height:64vh"></div>
   </section>
   <section class="panel" id="p-graph">
@@ -930,7 +1143,7 @@ const TECH_TACTICS = $tech_tactics;
 const TAG_COLORS = $tag_colors;
 const ALL = "__ALL__";
 
-let state = { host: ALL, q: "", hideBenign: false };
+let state = { host: ALL, q: "", hideBenign: false, tlMode: "attack", tlGroup: "collapse" };
 const hosts = DATA.hosts;
 
 function inHost(itemHosts){
@@ -963,9 +1176,13 @@ function renderChips(){
 }
 
 /* ---- stats ---- */
+function tlRows(mode){
+  if(mode==='all') return DATA.timeline;
+  return DATA.attack_timeline && DATA.attack_timeline.length ? DATA.attack_timeline : DATA.timeline;
+}
 function renderStats(){
   const obs = filtObs(DATA.observables);
-  const tl = DATA.timeline.filter(r => inHost([r.host]) && textMatch(JSON.stringify(r)));
+  let tl = tlRows(state.tlMode).filter(r => inHost([r.host]) && textMatch(JSON.stringify(r)));
   const tech = new Set(); obs.forEach(o => (o.mitre||"").split(/[,\s]+/).forEach(t=>t&&tech.add(t)));
   const cards = [
     ['Endpoints', hosts.length],
@@ -980,29 +1197,67 @@ function renderStats(){
 
 /* ---- timeline ---- */
 let timelineObj = null;
+function tlTooltip(r,host){
+  const lines=[r.time_utc,'host: '+host,'actor: '+r.actor,'technique: '+r.technique,
+    'tags: '+r.tags,'evidence: '+r.evidence];
+  const iocs=(r.observables||[]);
+  if(iocs.length) lines.push('IOCs: '+iocs.join('; '));
+  return esc(lines.filter(x=>x.split(': ')[1]).join('\n'));
+}
+function groupRows(rows){
+  if(state.tlGroup==='none') return rows.map(r=>({r,count:1}));
+  const m=new Map();
+  for(const r of rows){
+    const k=[r.time_utc,r.host,r.event,r.actor,r.technique,r.tags,r.evidence].join('\x1f');
+    const e=m.get(k);
+    if(e) e.count++; else m.set(k,{r,count:1});
+  }
+  return [...m.values()];
+}
+/* clamp user zoom to the displayed rows so the time axis always shows
+   incident-relevant timestamps (no de-zoom back to 1990). */
+function tlBounds(rows){
+  let lo=null, hi=null;
+  (rows||[]).forEach(r=>{ const t=Date.parse(r.time_utc); if(!isNaN(t)){ if(lo===null||t<lo)lo=t; if(hi===null||t>hi)hi=t; } });
+  if(lo===null) return {};
+  const pad=Math.max((hi-lo)*0.04, 1800000);   // >= 30 min margin
+  return {min:new Date(lo-pad), max:new Date(hi+pad)};
+}
+function tlZoom(dir){
+  if(!timelineObj) return;
+  try{ dir>0 ? timelineObj.zoomIn(0.3,{animation:false})
+             : timelineObj.zoomOut(0.3,{animation:false}); }catch(e){}
+  try{ timelineObj.redraw(); }catch(e){}
+}
 function renderTimeline(){
-  const rows = DATA.timeline.filter(r => inHost([r.host]) && textMatch(JSON.stringify(r)));
+  const rows = tlRows(state.tlMode).filter(r => inHost([r.host]) && textMatch(JSON.stringify(r)));
+  const grouped = groupRows(rows);
   const el = document.getElementById('container');
   const items=[], groups=[], seen=new Set();
-  rows.forEach((r,i)=>{
-    const host=r.host;
+  grouped.forEach((g,i)=>{
+    const r=g.r, host=r.host;
     if(!seen.has(host)){ seen.add(host); groups.push({id:host, content:esc(host)}); }
     const tags=(r.tags||'').split(';').filter(Boolean);
     const ptag=tags[0]||'default';
+    const linked=(r.observables||[]).length>0;
+    const bg=TAG_COLORS[ptag]||'#3498db';
+    const label=(r.event||'').slice(0,70)+(g.count>1?'  ×'+g.count:'');
     items.push({id:i, group:host, start:r.time_utc||null,
-      content:esc((r.event||'').slice(0,70)),
-      className:'tl-'+(TAG_COLORS[ptag]?'x':'default'),
-      style:'background:'+(TAG_COLORS[ptag]||'#3498db')+';border-color:'+(TAG_COLORS[ptag]||'#3498db')+';color:#fff',
-      title:esc([r.time_utc,'host: '+host,'actor: '+r.actor,'technique: '+r.technique,
-             'tags: '+r.tags,'evidence: '+r.evidence].filter(x=>x.split(': ')[1]).join('\n'))});
+      content:esc(label),
+      style:'background:'+bg+';border-color:'+(linked?'#e74c3c':bg)+';color:#fff;'
+        +(linked?'border-width:2px':''),
+      title:tlTooltip(r,host)});
   });
   if(timelineObj){ try{timelineObj.destroy();}catch(e){} timelineObj=null; }
   el.innerHTML='';
   if(!items.length){ el.innerHTML='<div class="empty">No timeline rows for this filter.</div>'; return; }
   if(!(window.vis && vis.Timeline)){ el.innerHTML='<div class="empty">Timeline library unavailable.</div>'; return; }
-  timelineObj = new vis.Timeline(el, new vis.DataSet(items), new vis.DataSet(groups),
+  const opts = Object.assign(
     {stack:true, zoomable:true, moveable:true, selectable:true, horizontalScroll:true,
-     minHeight:'100%', margin:{item:{horizontal:4}}});
+     height:'100%', maxHeight:'100%', verticalScroll:true, zoomKey:'ctrlKey',
+     margin:{item:{horizontal:4}}}, tlBounds(rows));
+  timelineObj = new vis.Timeline(el, new vis.DataSet(items), new vis.DataSet(groups), opts);
+  try{ timelineObj.fit(); }catch(e){}
 }
 
 /* ---- graph ---- */
@@ -1052,18 +1307,24 @@ function renderTrees(){
 function countNodes(roots){ let n=0; const w=r=>{n++; r.children.forEach(w);}; roots.forEach(w); return n; }
 
 /* ---- tables ---- */
+function seenCell(ts, derived, ref){
+  if(!ts) return '';
+  if(derived) return `<span class="mono" title="derived from ${esc(ref||'evidence')}">${esc(ts)}<sup>*</sup></span>`;
+  return `<span class="mono">${esc(ts)}</span>`;
+}
 function obsRow(o){
   const val = o.defanged ? `<span class="mono">${esc(o.defanged)}</span>` : `<span class="mono">${esc(o.value)}</span>`;
   const hs = (o.hosts||[]).map(h=>`<span class="tag">${esc(h)}</span>`).join('');
   const tags=(o.tags||[]).map(t=>`<span class="tag">${esc(t)}</span>`).join('');
   const conf=o.confidence?`<span class="badge b-${o.confidence}">${o.confidence}</span>`:'';
-  return `<tr><td class="mono">${esc(o.first_seen_utc||'')}</td>
+  return `<tr><td>${seenCell(o.first_seen_utc,o.first_seen_derived,o.first_seen_ref)}</td>
+    <td>${seenCell(o.last_seen_utc,false,'')}</td>
     <td>${esc(o.type)}</td><td>${val}</td><td>${esc(o.role||'')}</td>
     <td>${hs}</td><td>${conf}</td>
     <td>${esc(o.mitre||'')}</td><td>${tags}</td>
     <td>${esc(o.context||'')}</td><td>${esc(o.source||'')}</td></tr>`;
 }
-const OBS_HEAD=['first seen (UTC)','type','value (defanged)','role','endpoints','confidence','mitre','tags','context','source'];
+const OBS_HEAD=['first seen (UTC)','last seen (UTC)','type','value (defanged)','role','endpoints','confidence','mitre','tags','context','source'];
 function renderTable(elId, list){
   const el=document.getElementById(elId);
   if(!list.length){ el.innerHTML='<div class="empty">No rows for this filter.</div>'; return; }
@@ -1074,7 +1335,8 @@ function renderTable(elId, list){
     return x.localeCompare(y);
   });
   el.innerHTML=`<div class="tablewrap"><table><thead><tr>${OBS_HEAD.map(h=>`<th>${h}</th>`).join('')}</tr></thead>
-    <tbody>${rows.map(obsRow).join('')}</tbody></table></div>`;
+    <tbody>${rows.map(obsRow).join('')}</tbody></table></div>
+    <p class="hint"><sup>*</sup> first/last seen derived from cited evidence (source reference or the matching timeline record); hover the value for the reference.</p>`;
 }
 function renderObservables(){ renderTable('obsTable', filtObs(DATA.observables)); }
 function renderIocs(){ renderTable('iocTable', filtObs(DATA.observables).filter(o=>!isBenign(o))); }
@@ -1143,12 +1405,32 @@ document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('section.panel').forEach(x=>x.classList.remove('active'));
   b.classList.add('active');
   document.getElementById('p-'+b.dataset.tab).classList.add('active');
-  if(b.dataset.tab==='timeline' && timelineObj) timelineObj.redraw();
+  if(b.dataset.tab==='timeline'){ renderTimeline(); if(timelineObj) timelineObj.redraw(); }
   if(b.dataset.tab==='graph' && netObj) netObj.redraw();
 });
 document.getElementById('search').oninput = e => { state.q = e.target.value;
   [renderStats, renderOverview, renderTimeline, renderObservables, renderIocs, renderMatrix].forEach(safe); };
 document.getElementById('hideBenign').onchange = e => { state.hideBenign = e.target.checked; renderAll(); };
+(function(){
+  const mode=document.getElementById('tlMode');
+  if(mode) mode.onchange = e => { state.tlMode = e.target.value; renderStats(); renderTimeline(); };
+  const grp=document.getElementById('tlGroup');
+  if(grp) grp.onchange = e => { state.tlGroup = e.target.value; renderStats(); renderTimeline(); };
+  const fit=document.getElementById('tlFit');
+  if(fit) fit.onclick = () => { if(timelineObj){ try{timelineObj.fit();}catch(e){} timelineObj.redraw(); } };
+  const zin=document.getElementById('tlIn');
+  if(zin) zin.onclick = () => tlZoom(1);
+  const zout=document.getElementById('tlOut');
+  if(zout) zout.onclick = () => tlZoom(-1);
+  const full=document.getElementById('tlFull');
+  if(full) full.onclick = () => {
+    const p=document.getElementById('p-timeline');
+    p.classList.toggle('tl-full');
+    full.textContent = p.classList.contains('tl-full') ? '⛶ exit' : '⛶ full screen';
+    if(timelineObj){ try{timelineObj.fit();}catch(e){} timelineObj.redraw();
+      setTimeout(()=>{ try{timelineObj.fit(); timelineObj.redraw();}catch(e){} }, 60); }
+  };
+})();
 
 renderChips();
 renderAll();
@@ -1240,6 +1522,16 @@ section.blk>p.blk-sub{color:var(--mut);font-size:12px;margin:0 0 14px}
 .switch{display:flex;align-items:center;gap:6px;color:var(--mut);font-size:12px;cursor:pointer}
 .applyall{margin-left:auto;font-size:11px;color:var(--mut);display:flex;align-items:center;gap:6px}
 #tl, #gc{width:100%;height:56vh;min-height:360px}
+section.blk.tl-full{position:fixed;inset:0;z-index:200;margin:0;border-radius:0;
+  display:flex;flex-direction:column;background:var(--panel)}
+section.blk.tl-full #tl{flex:1 1 auto;height:auto;min-height:0}
+.tl-tools{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 12px}
+.tl-tools .grow{flex:1 1 auto}
+.tl-tools select{background:var(--bg);border:1px solid var(--line);color:var(--fg);
+  border-radius:8px;padding:5px 8px;font-size:12px}
+.tl-tools button{background:var(--panel2);border:1px solid var(--line);color:var(--fg);
+  border-radius:8px;padding:5px 12px;cursor:pointer;font-size:12px}
+.tl-tools button:hover{border-color:var(--acc)}
 .legend{display:flex;gap:14px;flex-wrap:wrap;color:var(--mut);font-size:12px;margin:6px 0}
 .legend span.sw{display:inline-block;width:11px;height:11px;border-radius:2px;margin-right:4px}
 table{border-collapse:collapse;width:100%;font-size:12px}
@@ -1320,10 +1612,31 @@ footer{color:#6e7681;font-size:11px;padding:0 34px 40px;max-width:1600px;margin:
 
     <section class="blk" id="sec-timeline" data-sect="timeline">
       <h2 class="blk-title"><span><span class="accent">Chronology</span>Attack timeline (UTC)</span></h2>
-      <p class="blk-sub">Hover an item for its source record. Filtered to the endpoints selected below.</p>
+      <p class="blk-sub">Shows only the curated attack chain (suspect/malicious
+        events) by default; switch the mode to see all events. Hover an item for
+        its source record. Scroll vertically to navigate, Ctrl+wheel or −/+ to zoom.</p>
       <div class="filters" data-role="filters">
         <span class="flabel">Endpoints</span><div class="chips" data-chips></div>
         <input class="search" data-q placeholder="search…">
+      </div>
+      <div class="tl-tools">
+        <label class="switch">show
+          <select data-tl-mode>
+            <option value="attack" selected>attack chain</option>
+            <option value="all">all events</option>
+          </select>
+        </label>
+        <label class="switch">rows
+          <select data-tl-group>
+            <option value="collapse" selected>collapse identical</option>
+            <option value="none">every row</option>
+          </select>
+        </label>
+        <span class="grow"></span>
+        <button data-tl-out title="Zoom out (keep the time axis in view)">−</button>
+        <button data-tl-in title="Zoom in">+</button>
+        <button data-tl-fit title="Recenter / reset zoom on the displayed events">⟲ recenter</button>
+        <button data-tl-full title="Toggle full screen">⛶ full screen</button>
       </div>
       <div id="tl"></div>
     </section>
@@ -1394,7 +1707,7 @@ const ALL = "__ALL__";
 /* ---- per-section state ---- */
 const SECTIONS = ['timeline','graph','trees','observables','iocs','matrix'];
 const S = {};
-SECTIONS.forEach(id => S[id] = {host: ALL, q: "", hideBenign: false});
+SECTIONS.forEach(id => S[id] = {host: ALL, q: "", hideBenign: false, tlMode: "attack", tlGroup: "collapse"});
 function secEl(id){ return document.getElementById('sec-'+id); }
 function inHost(sec, hosts){ return sec.host===ALL || (hosts||[]).includes(sec.host); }
 function textMatch(sec, blob){ return !sec.q || (blob||"").toLowerCase().includes(sec.q.toLowerCase()); }
@@ -1435,6 +1748,25 @@ function buildFilters(){
     const b=bar.querySelector('[data-benign]');
     if(b) b.onchange=e=>{ S[id].hideBenign=e.target.checked; renderSection(id); };
   });
+  // timeline-only controls (mode / rows / recenter / full screen)
+  const blk=document.getElementById('sec-timeline'); if(!blk) return;
+  const mode=blk.querySelector('[data-tl-mode]');
+  if(mode) mode.onchange=e=>{ S.timeline.tlMode=e.target.value; renderSection('timeline'); };
+  const grp=blk.querySelector('[data-tl-group]');
+  if(grp) grp.onchange=e=>{ S.timeline.tlGroup=e.target.value; renderSection('timeline'); };
+  const zin=blk.querySelector('[data-tl-in]');
+  if(zin) zin.onclick=()=>tlZoomDoc(1);
+  const zout=blk.querySelector('[data-tl-out]');
+  if(zout) zout.onclick=()=>tlZoomDoc(-1);
+  const fit=blk.querySelector('[data-tl-fit]');
+  if(fit) fit.onclick=()=>{ if(VIS.timeline){try{VIS.timeline.fit();}catch(e){} VIS.timeline.redraw();} };
+  const full=blk.querySelector('[data-tl-full]');
+  if(full) full.onclick=()=>{
+    blk.classList.toggle('tl-full');
+    full.textContent=blk.classList.contains('tl-full')?'⛶ exit':'⛶ full screen';
+    if(VIS.timeline){try{VIS.timeline.fit();}catch(e){} VIS.timeline.redraw();
+      setTimeout(()=>{try{VIS.timeline.fit();VIS.timeline.redraw();}catch(e){}},60);}
+  };
 }
 
 /* ---- renderers ---- */
@@ -1450,27 +1782,65 @@ function renderSection(id){
     else if(id==='matrix') renderMatrix(sec);
   }catch(e){ console.error('[document]',id,e); }
 }
+function tlRowsDoc(mode){
+  if(mode==='all') return DATA.timeline;
+  return DATA.attack_timeline && DATA.attack_timeline.length ? DATA.attack_timeline : DATA.timeline;
+}
+function groupRowsDoc(rows,group){
+  if(group==='none') return rows.map(r=>({r,count:1}));
+  const m=new Map();
+  for(const r of rows){
+    const k=[r.time_utc,r.host,r.event,r.actor,r.technique,r.tags,r.evidence].join('\x1f');
+    const e=m.get(k);
+    if(e) e.count++; else m.set(k,{r,count:1});
+  }
+  return [...m.values()];
+}
+/* clamp user zoom to the displayed rows so the time axis always shows
+   incident-relevant timestamps (no de-zoom back to 1990). */
+function tlBoundsDoc(rows){
+  let lo=null, hi=null;
+  (rows||[]).forEach(r=>{ const t=Date.parse(r.time_utc); if(!isNaN(t)){ if(lo===null||t<lo)lo=t; if(hi===null||t>hi)hi=t; } });
+  if(lo===null) return {};
+  const pad=Math.max((hi-lo)*0.04, 1800000);
+  return {min:new Date(lo-pad), max:new Date(hi+pad)};
+}
+function tlZoomDoc(dir){
+  if(!VIS.timeline) return;
+  try{ dir>0 ? VIS.timeline.zoomIn(0.3,{animation:false})
+             : VIS.timeline.zoomOut(0.3,{animation:false}); }catch(e){}
+  try{ VIS.timeline.redraw(); }catch(e){}
+}
 function renderTimeline(sec){
-  const rows=DATA.timeline.filter(r=>inHost(sec,[r.host]) && textMatch(sec,JSON.stringify(r)));
+  const rows=tlRowsDoc(sec.tlMode).filter(r=>inHost(sec,[r.host]) && textMatch(sec,JSON.stringify(r)));
+  const grouped=groupRowsDoc(rows,sec.tlGroup);
   const el=document.getElementById('tl');
   const items=[],groups=[],seen=new Set();
-  rows.forEach((r,i)=>{
-    const host=r.host;
+  grouped.forEach((g,i)=>{
+    const r=g.r, host=r.host;
     if(!seen.has(host)){seen.add(host);groups.push({id:host,content:esc(host)});}
     const tags=(r.tags||'').split(';').filter(Boolean), ptag=tags[0]||'default';
+    const linked=(r.observables||[]).length>0, bg=TAG_COLORS[ptag]||'#3498db';
+    const lines=[r.time_utc,'host: '+host,'actor: '+r.actor,'technique: '+r.technique,
+      'tags: '+r.tags,'evidence: '+r.evidence];
+    if(linked) lines.push('IOCs: '+(r.observables||[]).join('; '));
+    const label=(r.event||'').slice(0,70)+(g.count>1?'  ×'+g.count:'');
     items.push({id:i,group:host,start:r.time_utc||null,
-      content:esc((r.event||'').slice(0,70)),
-      style:'background:'+(TAG_COLORS[ptag]||'#3498db')+';border-color:'+(TAG_COLORS[ptag]||'#3498db')+';color:#fff',
-      title:esc([r.time_utc,'host: '+host,'actor: '+r.actor,'technique: '+r.technique,
-             'tags: '+r.tags,'evidence: '+r.evidence].filter(x=>x.split(': ')[1]).join('\n'))});
+      content:esc(label),
+      style:'background:'+bg+';border-color:'+(linked?'#e5484d':bg)+';color:#fff;'
+        +(linked?'border-width:2px':''),
+      title:esc(lines.filter(x=>x.split(': ')[1]).join('\n'))});
   });
   if(VIS.timeline){try{VIS.timeline.destroy();}catch(e){} VIS.timeline=null;}
   el.innerHTML='';
   if(!items.length){el.innerHTML='<div class="empty">No timeline rows for this filter.</div>';return;}
   if(!(window.vis&&vis.Timeline)){el.innerHTML='<div class="empty">Timeline library unavailable.</div>';return;}
-  VIS.timeline=new vis.Timeline(el,new vis.DataSet(items),new vis.DataSet(groups),
+  const opts=Object.assign(
     {stack:true,zoomable:true,moveable:true,selectable:true,horizontalScroll:true,
-     minHeight:'100%',margin:{item:{horizontal:4}}});
+     height:'100%',maxHeight:'100%',verticalScroll:true,zoomKey:'ctrlKey',
+     margin:{item:{horizontal:4}}}, tlBoundsDoc(rows));
+  VIS.timeline=new vis.Timeline(el,new vis.DataSet(items),new vis.DataSet(groups),opts);
+  try{ VIS.timeline.fit(); }catch(e){}
 }
 function renderGraph(sec){
   const nodes=DATA.graph.nodes.filter(n=>inHost(sec,n.hosts));
@@ -1508,24 +1878,31 @@ function renderTrees(sec){
   }
   box.innerHTML=parts.length?parts.join(''):'<div class="empty">No process data for this filter.</div>';
 }
+function seenCell(ts,derived,ref){
+  if(!ts) return '';
+  if(derived) return `<span class="mono" title="derived from ${esc(ref||'evidence')}">${esc(ts)}<sup>*</sup></span>`;
+  return `<span class="mono">${esc(ts)}</span>`;
+}
 function obsRow(o){
   const val=o.defanged?`<span class="mono">${esc(o.defanged)}</span>`:`<span class="mono">${esc(o.value)}</span>`;
   const hs=(o.hosts||[]).map(h=>`<span class="tag">${esc(h)}</span>`).join('');
   const tags=(o.tags||[]).map(t=>`<span class="tag">${esc(t)}</span>`).join('');
   const conf=o.confidence?`<span class="badge b-${o.confidence}">${o.confidence}</span>`:'';
-  return `<tr><td class="mono">${esc(o.first_seen_utc||'')}</td>
+  return `<tr><td>${seenCell(o.first_seen_utc,o.first_seen_derived,o.first_seen_ref)}</td>
+    <td>${seenCell(o.last_seen_utc,false,'')}</td>
     <td>${esc(o.type)}</td><td>${val}</td><td>${esc(o.role||'')}</td>
     <td>${hs}</td><td>${conf}</td><td>${esc(o.mitre||'')}</td><td>${tags}</td>
     <td>${esc(o.context||'')}</td><td>${esc(o.source||'')}</td></tr>`;
 }
-const OBS_HEAD=['first seen (UTC)','type','value (defanged)','role','endpoints','confidence','mitre','tags','context','source'];
+const OBS_HEAD=['first seen (UTC)','last seen (UTC)','type','value (defanged)','role','endpoints','confidence','mitre','tags','context','source'];
 function renderTable(elId,list){
   const el=document.getElementById(elId);
   if(!list.length){el.innerHTML='<div class="empty">No rows for this filter.</div>';return;}
   const rows=[...list].sort((a,b)=>{const x=a.first_seen_utc||'',y=b.first_seen_utc||'';
     if(!x)return 1;if(!y)return -1;return x.localeCompare(y);});
   el.innerHTML=`<div class="tablewrap"><table><thead><tr>${OBS_HEAD.map(h=>`<th>${h}</th>`).join('')}</tr></thead>
-    <tbody>${rows.map(obsRow).join('')}</tbody></table></div>`;
+    <tbody>${rows.map(obsRow).join('')}</tbody></table></div>
+    <p class="blk-sub"><sup>*</sup> first/last seen derived from cited evidence (source reference or the matching timeline record); hover the value for the reference.</p>`;
 }
 function renderMatrix(sec){
   const obs=filtObs(sec,DATA.observables);
@@ -1621,6 +1998,12 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Build a single filterable incident dashboard HTML.")
     ap.add_argument("--iocs", required=True, help="structured IOC JSON")
     ap.add_argument("--timeline", help="normalized timeline CSV")
+    ap.add_argument("--attack-timeline",
+                    help="curated attack-chain CSV (time_utc,host,actor,event,"
+                         "technique,evidence,tags). Shown by default on the "
+                         "timeline; the full --timeline stays the 'all events' "
+                         "fallback. Defaults to analysis/attack_timeline.csv "
+                         "if present.")
     ap.add_argument("--graph", help="prebuilt graph.json (else rebuilt from IOCs + Zeek)")
     ap.add_argument("--zeek", help="directory of Zeek *.log")
     ap.add_argument("--proc", action="append", default=[],
@@ -1641,6 +2024,9 @@ def main(argv=None) -> int:
     ap.add_argument("--signatures", default="",
                     help="optional per-case signatures JSON (default: "
                          "analysis/signatures.json if present)")
+    ap.add_argument("--ip-map", default="",
+                    help="JSON host map (IP/FQDN/alias -> display name); defaults "
+                         "to the endpoints block of --iocs")
     ap.add_argument("--out", required=True, help="output directory")
     ap.add_argument("--title", default="Incident", help="case title")
     args = ap.parse_args(argv)
@@ -1648,6 +2034,16 @@ def main(argv=None) -> int:
     os.makedirs(args.out, exist_ok=True)
 
     set_signatures(args.signatures)
+
+    # host map: explicit --ip-map wins, else the IOC endpoints inventory
+    if args.ip_map:
+        set_host_map(args.ip_map)
+    elif hm is not None:
+        try:
+            _HOST_MAP.update(hm.load_map_from_obj(
+                json.load(open(args.iocs, encoding="utf-8"))))
+        except (OSError, ValueError):
+            pass
 
     iocs = read_iocs(args.iocs)
     if args.title == "Incident" and iocs.get("case"):
@@ -1657,6 +2053,21 @@ def main(argv=None) -> int:
     ipmap = ip_host_map(obs, endpoints)
 
     timeline = read_timeline(args.timeline) if args.timeline else []
+
+    # curated attack-chain timeline (shown by default); full timeline is the
+    # "all events" fallback. Default path mirrors the other analysis/ inputs.
+    attack_path = args.attack_timeline
+    if not attack_path and os.path.isfile(os.path.join("analysis",
+                                                       "attack_timeline.csv")):
+        attack_path = os.path.join("analysis", "attack_timeline.csv")
+    attack_timeline = []
+    if attack_path and os.path.isfile(attack_path):
+        attack_timeline = read_timeline(attack_path)
+    else:
+        if attack_path:
+            print(f"[incident_dashboard] --attack-timeline {attack_path}: "
+                  f"not found; timeline falls back to the full set",
+                  file=sys.stderr)
 
     # graph
     zeek_edges = []
@@ -1704,6 +2115,9 @@ def main(argv=None) -> int:
     for r in timeline:
         if r["host"]:
             tl_hosts.add(r["host"])
+    for r in attack_timeline:
+        if r["host"]:
+            tl_hosts.add(r["host"])
     for o in obs:
         hs = o.get("hosts") or []
         obs_hosts.update(hs)
@@ -1725,6 +2139,12 @@ def main(argv=None) -> int:
         hosts,
         key=lambda h: (order.index(h) if h in order else 99, h != "Network", h))
 
+    # correlate timeline rows with observables (adds row["observables"]) and
+    # back-fill any observable missing a first_seen_utc from cited evidence
+    link_timeline(timeline, obs)
+    link_timeline(attack_timeline, obs)
+    _derived = backfill_first_seen(obs, timeline)
+
     # trim graph nodes to json-friendly (vis needs id/label/color/size/title)
     gnodes = [{
         "id": n["id"], "label": n.get("label", n["id"]), "type": n.get("type", ""),
@@ -1737,6 +2157,7 @@ def main(argv=None) -> int:
         "case": args.title,
         "hosts": hosts_sorted,
         "timeline": timeline,
+        "attack_timeline": attack_timeline,
         "observables": obs,
         "graph": {"nodes": gnodes, "edges": edges},
         "trees": trees,
@@ -1812,8 +2233,13 @@ def main(argv=None) -> int:
 
     print(f"[incident_dashboard] wrote {', '.join(written)}", file=sys.stderr)
     print(f"  hosts: {', '.join(hosts_sorted)}", file=sys.stderr)
-    print(f"  timeline: {len(timeline)} | observables: {len(obs)} | "
+    print(f"  timeline: {len(timeline)} | attack-timeline: "
+          f"{len(attack_timeline) if attack_timeline else 'none (full set)'} | "
+          f"observables: {len(obs)} | "
           f"graph: {len(gnodes)}n/{len(edges)}e | tree-hosts: {len(trees)}", file=sys.stderr)
+    print(f"  timeline linked to observables: "
+          f"{sum(1 for r in timeline if r.get('observables'))} | "
+          f"first-seen derived: {_derived}", file=sys.stderr)
     return 0
 
 
